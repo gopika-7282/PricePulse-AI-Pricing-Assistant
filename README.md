@@ -19,7 +19,8 @@ The system aims to provide explainable and profit-aware price recommendations us
 - Frontend: React / Next.js
 - Backend: FastAPI
 - AI Framework: LangGraph + LangChain
-- LLM: Google Gemini API
+- LLM: Ollama (Local LLM)
+- Models: Llama 3 / Qwen / Mistral
 - Database: PostgreSQL
 - Vector Database: ChromaDB
 - Machine Learning: Prophet, Reinforcement Learning
