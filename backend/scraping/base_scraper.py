@@ -45,6 +45,9 @@ class BaseScraper:
         self.headless = headless
         self.timeout_ms = timeout_ms
         self.max_retries = max_retries
+        self.last_navigation_status = None
+        self.last_navigation_error = None
+        self.search_result_status = "PARSE_ERROR"
         self.user_agent = (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -63,11 +66,8 @@ class BaseScraper:
         browser = await p.chromium.launch(
             headless=self.headless,
             args=[
-                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
-                "--disable-web-security",
-                "--disable-features=IsolateOrigins,site-per-process",
             ]
         )
         context = await browser.new_context(
@@ -86,15 +86,48 @@ class BaseScraper:
         Returns True if page loaded, False on critical error.
         """
         t = timeout or self.timeout_ms
+        self.last_navigation_status = None
+        self.last_navigation_error = None
         try:
             await page.goto(url, wait_until=wait_until, timeout=t)
             return True
         except PlaywrightTimeoutError:
+            self.last_navigation_status = "TIMEOUT"
+            self.last_navigation_error = "Navigation timed out"
             logger.warning(f"[BASE_SCRAPER] Timeout loading {url}. Continuing with rendered DOM.")
             return True
         except Exception as e:
+            self.last_navigation_status = "NETWORK_ERROR"
+            self.last_navigation_error = str(e)
             logger.error(f"[BASE_SCRAPER] Navigation failed for {url}: {e}")
             return False
+
+    @staticmethod
+    def classify_empty_search(html: str) -> str:
+        text = (html or "").lower()
+        if any(marker in text for marker in ("no results found", "no products found", "did not match any products", "try a different search")):
+            return "EMPTY"
+        return "PARSE_ERROR"
+
+    def search_failure_message(self) -> str:
+        if self.search_result_status == "EMPTY":
+            return "No matching products were returned by the marketplace."
+        if self.search_result_status == "TIMEOUT":
+            return "Marketplace navigation timed out."
+        if self.search_result_status == "NETWORK_ERROR":
+            return "Marketplace connection failed during navigation."
+        return "The search page loaded, but its product cards could not be parsed."
+
+    @staticmethod
+    def classify_status(status: str, error: Any = "") -> str:
+        value = str(status or "").upper()
+        message = str(error or "").lower()
+        if value == "OK": return "SUCCESS"
+        if value in {"SUCCESS", "BLOCKED", "EMPTY", "PARSE_ERROR", "NETWORK_ERROR", "TIMEOUT"}: return value
+        if any(term in message for term in ("captcha", "robot check", "access denied", "verify you are human", "security challenge")): return "BLOCKED"
+        if "timeout" in message or "timed out" in message: return "TIMEOUT"
+        if any(term in message for term in ("connection reset", "connection error", "dns", "name resolution", "network", "navigation failed")): return "NETWORK_ERROR"
+        return "PARSE_ERROR"
 
     async def scroll_page(self, page: Page, count: int = 3, delay_ms: int = 800) -> None:
         """Scroll page to trigger lazy loading of dynamic content."""

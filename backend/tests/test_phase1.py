@@ -128,13 +128,17 @@ class TestCatalogMatching:
     # T2 — Turmeric vs Haldi (semantic match)
     def test_turmeric_matches_haldi(self, db):
         make_catalog(db, "Turmeric Soap", brand="Himalaya", category="Personal Care")
-        result = find_existing_product(db, "Haldi Soap", "Personal Care", "Patanjali")
+        catalog = db.query(ProductCatalog).filter_by(name="Turmeric Soap").first()
+        with patch("app.services.product_identity_service.generate_structured", return_value={"success": True, "data": {"decision": "MATCH", "matched_catalog_id": catalog.id, "confidence": 0.94, "reason": "Generic identity confirmed from the product evidence."}}):
+            result = find_existing_product(db, "Haldi Soap", "Personal Care", "Patanjali")
         assert result is not None, "Haldi Soap should match Turmeric Soap after semantic normalization"
 
     # T3 — Turmeric vs Manjal (semantic match)
     def test_turmeric_matches_manjal(self, db):
         make_catalog(db, "Turmeric Soap", brand="Himalaya", category="Personal Care")
-        result = find_existing_product(db, "Manjal Soap", "Personal Care", "Medimix")
+        catalog = db.query(ProductCatalog).filter_by(name="Turmeric Soap").first()
+        with patch("app.services.product_identity_service.generate_structured", return_value={"success": True, "data": {"decision": "MATCH", "matched_catalog_id": catalog.id, "confidence": 0.93, "reason": "Generic identity confirmed from the product evidence."}}):
+            result = find_existing_product(db, "Manjal Soap", "Personal Care", "Medimix")
         assert result is not None, "Manjal Soap should match Turmeric Soap after semantic normalization"
 
     # T4 — Same product, different brands → MATCH

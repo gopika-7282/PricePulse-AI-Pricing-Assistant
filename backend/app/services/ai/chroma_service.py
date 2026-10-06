@@ -29,11 +29,15 @@ Does NOT:
 """
 
 import logging
+import hashlib
+import math
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import chromadb
 from chromadb.config import Settings
+from chromadb.api.types import EmbeddingFunction
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +53,45 @@ CHATBOT_RAG_COLLECTION  = "chatbot_rag"
 # ---- Singleton client --------------------------------------------------------
 
 _chroma_client: Optional[chromadb.ClientAPI] = None
+
+
+class _HashEmbedding(EmbeddingFunction[List[str]]):
+    """Small deterministic lexical embedding; avoids Chroma's default MiniLM model."""
+    def __init__(self) -> None:
+        pass
+
+    @staticmethod
+    def name() -> str:
+        return "pricepulse_hash_embedding_v1"
+
+    def get_config(self) -> Dict[str, Any]:
+        return {"dimensions": 384}
+
+    @staticmethod
+    def build_from_config(config: Dict[str, Any]) -> "_HashEmbedding":
+        return _HashEmbedding()
+
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        vectors = []
+        for document in input:
+            vector = [0.0] * 384
+            tokens = re.findall(r"[\w]+", document.lower())
+            for token in tokens:
+                digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+                idx = int.from_bytes(digest[:4], "big") % len(vector)
+                sign = 1.0 if digest[4] & 1 else -1.0
+                vector[idx] += sign
+            magnitude = math.sqrt(sum(value * value for value in vector)) or 1.0
+            vectors.append([value / magnitude for value in vector])
+        return vectors
+
+    def embed_query(self, input: Any) -> Any:
+        if isinstance(input, str):
+            return self([input])[0]
+        return self(list(input))
+
+    def embed_documents(self, input: List[str]) -> List[List[float]]:
+        return self(input)
 
 
 def _get_client() -> chromadb.ClientAPI:
@@ -71,6 +114,7 @@ def get_collection(collection_name: str) -> chromadb.Collection:
     collection = client.get_or_create_collection(
         name=collection_name,
         metadata={"description": "RAG context collection: " + collection_name},
+        embedding_function=_HashEmbedding(),
     )
     logger.debug(
         "[CHROMA_RAG] Collection '%s' ready. Document count: %d",
@@ -93,7 +137,7 @@ def store_document(
         return
 
     collection = get_collection(collection_name)
-    meta = metadata or {}
+    meta = metadata or {"source": "unspecified"}
 
     collection.upsert(
         ids=[doc_id],
@@ -139,7 +183,7 @@ def store_documents_batch(
 
         valid_ids.append(doc_id)
         valid_texts.append(text)
-        valid_metas.append(meta)
+        valid_metas.append(meta or {"source": "unspecified"})
 
     if not valid_ids:
         return 0
@@ -305,9 +349,10 @@ def index_pricing_recommendation(
     market_avg: float = 0.0,
     min_price: float = 0.0,
     max_price: float = 0.0,
+    user_id: Optional[int] = None,
 ) -> None:
     """Index a pricing recommendation into the pricing RAG collection."""
-    doc_id = "rec_" + str(retailer_product_id)
+    doc_id = "rec_" + (str(user_id) + "_" if user_id is not None else "") + str(retailer_product_id)
     text = (
         "Pricing recommendation for: " + product_name + "\n"
         "Recommended price: Rs." + str(round(recommended_price, 2)) + "\n"
@@ -321,6 +366,7 @@ def index_pricing_recommendation(
         "catalog_product_id": str(catalog_product_id),
         "product_name": product_name,
         "recommended_price": str(recommended_price),
+        "user_id": str(user_id) if user_id is not None else "",
     }
     store_document(collection_name=PRICING_RAG_COLLECTION, doc_id=doc_id, text=text, metadata=meta)
     store_document(collection_name=CHATBOT_RAG_COLLECTION, doc_id="pricing_" + doc_id, text=text, metadata=meta)
@@ -332,6 +378,8 @@ def retrieve_chatbot_context(
     query: str,
     catalog_product_id: Optional[int] = None,
     n_results: int = 5,
+    retailer_product_id: Optional[int] = None,
+    user_id: Optional[int] = None,
 ) -> str:
     """
     Retrieve relevant RAG context for a chatbot query.
@@ -350,6 +398,8 @@ def retrieve_chatbot_context(
     )
 
     if not hits:
+        if catalog_product_id is not None:
+            return ""
         pricing_hits = retrieve_relevant(
             collection_name=PRICING_RAG_COLLECTION, query=query,
             n_results=max(1, n_results // 2),
@@ -359,6 +409,11 @@ def retrieve_chatbot_context(
             n_results=max(1, n_results // 2),
         )
         hits = pricing_hits + product_hits
+
+    if retailer_product_id is not None:
+        hits = [hit for hit in hits if hit.get("metadata", {}).get("type") != "pricing_recommendation"
+                or (hit.get("metadata", {}).get("retailer_product_id") == str(retailer_product_id)
+                    and (user_id is None or hit.get("metadata", {}).get("user_id") == str(user_id)))]
 
     if not hits:
         return ""
@@ -374,6 +429,8 @@ def retrieve_pricing_context(
     query: str,
     catalog_product_id: Optional[int] = None,
     n_results: int = 8,
+    retailer_product_id: Optional[int] = None,
+    user_id: Optional[int] = None,
 ) -> str:
     """Retrieve relevant pricing context for the Strategist Agent."""
     where_filter = None
@@ -386,6 +443,11 @@ def retrieve_pricing_context(
         n_results=n_results,
         where=where_filter,
     )
+
+    if retailer_product_id is not None:
+        hits = [hit for hit in hits if hit.get("metadata", {}).get("type") != "pricing_recommendation"
+                or (hit.get("metadata", {}).get("retailer_product_id") == str(retailer_product_id)
+                    and (user_id is None or hit.get("metadata", {}).get("user_id") == str(user_id)))]
 
     if not hits:
         return ""

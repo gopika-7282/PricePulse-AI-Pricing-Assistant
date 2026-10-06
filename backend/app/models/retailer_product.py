@@ -22,3 +22,19 @@ class RetailerProduct(Base):
     price_analysis = relationship("PriceAnalysis", back_populates="retailer_product", cascade="all, delete-orphan")
     recommendation = relationship("Recommendation", back_populates="retailer_product", cascade="all, delete-orphan")
     agent_logs = relationship("AgentLog", back_populates="retailer_product", cascade="all, delete-orphan")
+
+    @property
+    def product_name(self):
+        return self.catalog_product.name if self.catalog_product else ""
+
+    @property
+    def category(self):
+        return self.catalog_product.category if self.catalog_product else None
+
+    @property
+    def brand(self):
+        return self.catalog_product.brand if self.catalog_product else None
+
+    @property
+    def product_details(self):
+        return self.catalog_product.product_details if self.catalog_product else None

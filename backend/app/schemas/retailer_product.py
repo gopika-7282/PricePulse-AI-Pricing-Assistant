@@ -27,6 +27,10 @@ class RetailerProductResponse(BaseModel):
     cost_price: float
     stock_quantity: int
     minimum_profit_margin: float
+    product_name: str = ""
+    category: str | None = None
+    brand: str | None = None
+    product_details: str | None = None
     created_at: datetime
     updated_at: datetime
 

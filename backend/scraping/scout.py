@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from scraping.flipkart_scraper import FlipkartScraper
 from scraping.amazon_scraper import AmazonScraper
+from scraping.myntra_scraper import MyntraScraper
+from scraping.meesho_scraper import MeeshoScraper
 from scraping.validator import validate_products
 from app.services.competitor_service import normalize_competitor_url
 from app.services.relevance_filter_service import filter_candidate_products
@@ -28,6 +30,22 @@ from app.services.relevance_filter_service import filter_candidate_products
 logger = logging.getLogger(__name__)
 
 HARD_MAX_PRODUCTS = 10
+
+
+def _failure_status(status: str, error: Any = "") -> str:
+    status = str(status or "").upper()
+    message = str(error or "").lower()
+    if status == "OK":
+        return "SUCCESS"
+    if status in {"BLOCKED", "TIMEOUT", "PARSE_ERROR", "NETWORK_ERROR", "EMPTY", "SUCCESS"}:
+        return status
+    if "captcha" in message or "robot check" in message or "access denied" in message or "human verification" in message:
+        return "BLOCKED"
+    if "timeout" in message or "timed out" in message:
+        return "TIMEOUT"
+    if any(term in message for term in ("connection reset", "connection error", "dns", "name resolution", "network", "navigation failed")):
+        return "NETWORK_ERROR"
+    return "PARSE_ERROR" if status in {"FAILED", "ERROR", "OK"} else "EMPTY"
 
 
 def process_platform_pipeline(
@@ -99,6 +117,8 @@ class ScoutScraper:
         self.max_retries = max_retries
         self._flipkart = FlipkartScraper(headless=headless, max_retries=max_retries)
         self._amazon = AmazonScraper(headless=headless, max_retries=max_retries)
+        self._myntra = MyntraScraper(headless=headless, max_retries=max_retries)
+        self._meesho = MeeshoScraper(headless=headless, max_retries=max_retries)
 
     async def _run_flipkart(
         self,
@@ -119,7 +139,7 @@ class ScoutScraper:
             if not isinstance(res, dict):
                 res = {"platform": "Flipkart", "status": "SUCCESS" if res else "EMPTY", "products": res or []}
 
-            status = res.get("status", "EMPTY")
+            status = _failure_status(res.get("status", "EMPTY"), res.get("error"))
             if status in ("BLOCKED", "TIMEOUT", "PARSE_ERROR"):
                 return {
                     "platform": "Flipkart",
@@ -167,7 +187,7 @@ class ScoutScraper:
             if not isinstance(res, dict):
                 res = {"platform": "Amazon", "status": "SUCCESS" if res else "EMPTY", "products": res or []}
 
-            status = res.get("status", "EMPTY")
+            status = _failure_status(res.get("status", "EMPTY"), res.get("error"))
             if status in ("BLOCKED", "TIMEOUT", "PARSE_ERROR"):
                 return {
                     "platform": "Amazon",
@@ -209,16 +229,46 @@ class ScoutScraper:
         """
         limit = min(max_products or HARD_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
 
-        # 1. Flipkart
-        flipkart_res = await self._run_flipkart(product_name, category, product_details, limit)
+        # Execute independently and sequentially so one site's challenge or
+        # network failure cannot prevent collection from the remaining sites.
+        async def safely_run(platform, runner):
+            try:
+                return await runner(product_name, category, product_details, limit)
+            except Exception as exc:
+                return {"platform": platform, "status": _failure_status("FAILED", exc), "products": [], "error": str(exc)}
 
-        # 2. Amazon (sequential, isolated from Flipkart failure)
-        amazon_res = await self._run_amazon(product_name, category, product_details, limit)
+        flipkart_res = await safely_run("Flipkart", self._run_flipkart)
+        amazon_res = await safely_run("Amazon", self._run_amazon)
+        myntra_res = await safely_run("Myntra", self._run_myntra)
+        meesho_res = await safely_run("Meesho", self._run_meesho)
 
         return {
             "Flipkart": flipkart_res,
             "Amazon": amazon_res,
+            "Myntra": myntra_res,
+            "Meesho": meesho_res,
         }
+
+    async def _run_additional_platform(self, scraper, platform, method_name, product_name, category, product_details, limit):
+        try:
+            result = await getattr(scraper, method_name)(product_name, category, product_details, limit)
+            status = _failure_status(result.get("status", "EMPTY"), result.get("error"))
+            if status not in {"SUCCESS", "BLOCKED", "EMPTY", "PARSE_ERROR", "NETWORK_ERROR", "TIMEOUT"}:
+                status = "PARSE_ERROR"
+            products = result.get("products", []) if status == "SUCCESS" else []
+            if status == "SUCCESS":
+                products, _ = process_platform_pipeline(platform, product_name, category, products, limit)
+                status = "SUCCESS" if products else "EMPTY"
+            return {"platform": platform, "status": status, "products": products[:limit], "error": result.get("error")}
+        except Exception as exc:
+            logger.warning("[SCOUT] %s failed: %s", platform, exc)
+            return {"platform": platform, "status": _failure_status("FAILED", exc), "products": [], "error": str(exc)}
+
+    async def _run_myntra(self, product_name, category=None, product_details=None, max_products=10):
+        return await self._run_additional_platform(self._myntra, "Myntra", "scrape_myntra_with_retry", product_name, category, product_details, max_products)
+
+    async def _run_meesho(self, product_name, category=None, product_details=None, max_products=10):
+        return await self._run_additional_platform(self._meesho, "Meesho", "scrape_meesho_with_retry", product_name, category, product_details, max_products)
 
     async def get_competitor_data(
         self,
@@ -265,11 +315,11 @@ class ScoutScraper:
         failed = []
 
         for plat_name, res in seq_res.items():
-            status = res.get("status", "EMPTY")
+            status = _failure_status(res.get("status", "EMPTY"), res.get("error"))
             platform_statuses[plat_name] = status
             if status == "BLOCKED":
                 blocked.append(plat_name)
-            elif status in ("PARSE_ERROR", "TIMEOUT"):
+            elif status not in ("SUCCESS", "EMPTY"):
                 failed.append(plat_name)
             elif status == "SUCCESS":
                 all_products.extend(res.get("products", []))

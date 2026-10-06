@@ -128,6 +128,9 @@ def scrape_product(db: Session, catalog_product: ProductCatalog):
     # -- Unpack platform results -----------------------------------------------
     raw_scraped_data: list = scout_result.get("products", [])
     platform_statuses: dict = scout_result.get("platform_statuses", {})
+    # Keep this request's genuine platform outcomes available to the workflow
+    # response without changing the catalog schema or treating failures as OK.
+    catalog_product.marketplace_statuses = platform_statuses
     blocked_platforms: list = scout_result.get("blocked_platforms", [])
     failed_platforms: list = scout_result.get("failed_platforms", [])
 

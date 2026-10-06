@@ -337,11 +337,11 @@ class TestProductIdentityAgent:
 
     def test_llm_failure_falls_back_to_uncertain(self, db):
         """LLM unavailable -> should fall back to UNCERTAIN_MATCH (never crash)."""
-        make_catalog(db, "Turmeric Soap", details="Herbal turmeric soap")
+        make_catalog(db, "Hibiscus Hair Oil", details="Herbal hair oil")
         with patch("app.services.product_identity_service.generate_structured",
                    return_value={"success": False, "data": None, "error": "Ollama unavailable"}):
             result = evaluate_product_identity(
-                db, "Turmeric Soap", product_details="Herbal turmeric soap"
+                db, "Hair Oil", product_details="Herbal hair oil"
             )
         assert result.decision == IdentityDecision.UNCERTAIN_MATCH
         assert result.confidence == 0.0
@@ -355,7 +355,7 @@ class TestProductIdentityAgent:
 
     def test_invalid_llm_id_rejected(self, db):
         """LLM returns ID not in candidate set -> forced UNCERTAIN_MATCH."""
-        cat = make_catalog(db, "Turmeric Soap", details="Herbal turmeric soap")
+        cat = make_catalog(db, "Hibiscus Hair Oil", details="Herbal hair oil")
         fake_id = cat.id + 9999  # ID that does not exist in candidates
         with patch("app.services.product_identity_service.generate_structured",
                    return_value={
@@ -370,7 +370,7 @@ class TestProductIdentityAgent:
                        "error": None,
                    }):
             result = evaluate_product_identity(
-                db, "Turmeric Soap", product_details="Herbal turmeric soap"
+                db, "Hair Oil", product_details="Herbal hair oil"
             )
         assert result.decision == IdentityDecision.UNCERTAIN_MATCH
 

@@ -48,9 +48,11 @@ STOP_WORDS: Set[str] = {
 
 
 class IdentityDecision(str, Enum):
-    MATCH_EXISTING = "MATCH_EXISTING"
+    MATCH = "MATCH"
+    MATCH_EXISTING = "MATCH"  # compatibility alias for existing service callers
     UNCERTAIN_MATCH = "UNCERTAIN_MATCH"
-    NEW_PRODUCT = "NEW_PRODUCT"
+    NOT_MATCH = "NOT_MATCH"
+    NEW_PRODUCT = "NOT_MATCH"  # compatibility alias; public decision is NOT_MATCH
 
 
 class IdentityOutput(BaseModel):
@@ -180,19 +182,19 @@ EXISTING CATALOG CANDIDATES (Choose at most one matching catalog_id):
 {json.dumps(candidates_repr, indent=2)}
 
 TASK:
-Determine if the INCOMING PRODUCT is the EXACT SAME generic product as one of the candidates, an UNCERTAIN match, or a NEW_PRODUCT.
+Determine if the INCOMING PRODUCT is the EXACT SAME generic product as one of the candidates, an UNCERTAIN_MATCH, or NOT_MATCH.
 
 CORE RULES:
 1. Primary signals: product name and description. Supporting signals: product type, intended use, key active ingredient/material.
-2. IGNORE BRAND COMPLETELY: Brand is metadata, not generic identity. Different brands of the same product type and active ingredient (e.g. Brand A "Hibiscus Hair Oil" vs Brand B "Hibiscus Hair Oil") represent the SAME generic catalog product.
-3. Same category != same product: "Turmeric Soap" and "Turmeric Shampoo" share category, but are different product types. Different product type OR different key ingredient => NEW_PRODUCT.
-4. Regional and multilingual names are OK when context supports them: e.g. "Haldi" / "Manjal" is Turmeric; "Gudhal" / "Sembaruthi" is Hibiscus.
+2. IGNORE BRAND COMPLETELY: Brand is metadata, not generic identity. Different brands of the same product type and active ingredient can represent the SAME generic catalog product.
+3. Same category != same product: differing product types or key ingredients mean NOT_MATCH.
+4. Regional, multilingual, typo, and transliteration matches must be inferred from the complete product evidence, not a hardcoded alias list.
 5. Generic reasoning only: No hardcoded brand or category bias.
 
 REQUIRED OUTPUT FORMAT (JSON only):
 {{
-  "decision": "MATCH_EXISTING" | "UNCERTAIN_MATCH" | "NEW_PRODUCT",
-  "matched_catalog_id": <catalog_id integer if MATCH_EXISTING, else null>,
+  "decision": "MATCH" | "UNCERTAIN_MATCH" | "NOT_MATCH",
+  "matched_catalog_id": <catalog_id integer if MATCH, else null>,
   "confidence": <float 0.0 to 1.0>,
   "reason": "<concise explanation>",
   "identity_factors": ["<factor1>", "<factor2>"]
@@ -226,6 +228,24 @@ def evaluate_product_identity(
             confidence=1.0,
             reason="Catalog contains no candidates",
             identity_factors=["empty_catalog"],
+        )
+
+    # An exact normalized name is a safe, deterministic shortcut for the
+    # unambiguous case. Ambiguous names still go to Qwen; no product aliases
+    # or language-specific mappings are embedded here.
+    incoming_tokens = set(extract_search_tokens(product_name))
+    exact_name_candidates = [
+        candidate for candidate in candidates
+        if incoming_tokens and set(extract_search_tokens(candidate.name or "")) == incoming_tokens
+    ]
+    if exact_name_candidates:
+        best = exact_name_candidates[0]
+        return IdentityOutput(
+            decision=IdentityDecision.MATCH,
+            matched_catalog_id=best.id,
+            confidence=0.99,
+            reason="The normalized product name matches an existing catalog item.",
+            identity_factors=["normalized_name_match"],
         )
 
     candidate_ids = {c.id for c in candidates}
@@ -272,6 +292,7 @@ def evaluate_product_identity(
     # ── Python Validation (Pydantic + candidate containment) ───────────────
     try:
         raw_decision = str(data.get("decision", "")).strip().upper()
+        raw_decision = {"MATCH_EXISTING": "MATCH", "NEW_PRODUCT": "NOT_MATCH"}.get(raw_decision, raw_decision)
         if raw_decision not in [d.value for d in IdentityDecision]:
             raw_decision = IdentityDecision.UNCERTAIN_MATCH.value
 
@@ -287,7 +308,7 @@ def evaluate_product_identity(
             raw_decision = IdentityDecision.UNCERTAIN_MATCH.value
 
         validated_id = None
-        if raw_decision == IdentityDecision.MATCH_EXISTING.value:
+        if raw_decision == IdentityDecision.MATCH.value:
             if raw_id is not None:
                 try:
                     int_id = int(raw_id)

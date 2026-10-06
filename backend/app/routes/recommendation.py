@@ -7,7 +7,7 @@ from app.services.auth_service import get_db, get_current_user
 from app.models.user import User
 from app.services.product_service import get_retailer_product_by_id
 from app.services.recommendation_service import get_all_recommendations_for_user, get_recommendation_by_id
-from app.services.pricing_service import generate_recommendation
+from app.services.pricing_workflow import analyze_retailer_product
 from app.schemas.recommendation import RecommendationResponse
 
 router = APIRouter()
@@ -26,7 +26,14 @@ def trigger_generation(
         raise HTTPException(status_code=403, detail="Not authorized to generate recommendations for this product")
     
     try:
-        return generate_recommendation(db, request.retailer_product_id)
+        workflow = analyze_retailer_product(db, request.retailer_product_id)
+        recommendation = workflow.get("recommendation")
+        if not recommendation:
+            reasons = (workflow.get("compliance") or {}).get("reasons") or [workflow.get("error", "Workflow could not approve a recommendation.")]
+            raise HTTPException(status_code=422, detail=" ".join(reasons))
+        return recommendation
+    except HTTPException:
+        raise
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
     except Exception:

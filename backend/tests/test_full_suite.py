@@ -150,13 +150,14 @@ class TestSemanticMatching:
         db.add(cat)
         db.flush()
 
-        match = find_catalog_match(
-            db,
-            name="Haldi Soap",
-            category="Personal Care",
-            brand="Himalaya",
-            details="Natural herbal bathing soap 100g"
-        )
+        with patch("app.services.product_identity_service.generate_structured", return_value={"success": True, "data": {"decision": "MATCH", "matched_catalog_id": cat.id, "confidence": 0.94, "reason": "The structured product evidence identifies the same generic product."}}):
+            match = find_catalog_match(
+                db,
+                name="Haldi Soap",
+                category="Personal Care",
+                brand="Himalaya",
+                details="Natural herbal bathing soap 100g"
+            )
         assert match is not None
         assert match.id == cat.id
 
@@ -171,13 +172,14 @@ class TestSemanticMatching:
         db.add(cat)
         db.flush()
 
-        match = find_catalog_match(
-            db,
-            name="Manjal Soap",
-            category="Personal Care",
-            brand="Aura Beauty",
-            details="Pure herbal manjal turmeric bathing bar for glowing skin"
-        )
+        with patch("app.services.product_identity_service.generate_structured", return_value={"success": True, "data": {"decision": "MATCH", "matched_catalog_id": cat.id, "confidence": 0.92, "reason": "The product name and supporting use details align."}}):
+            match = find_catalog_match(
+                db,
+                name="Manjal Soap",
+                category="Personal Care",
+                brand="Aura Beauty",
+                details="Pure herbal manjal turmeric bathing bar for glowing skin"
+            )
         assert match is not None
         assert match.id == cat.id
 

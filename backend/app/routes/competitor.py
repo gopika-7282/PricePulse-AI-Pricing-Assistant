@@ -4,6 +4,8 @@ from typing import List
 
 from app.services.auth_service import get_db, get_current_user
 from app.models.user import User
+from app.models.retailer_product import RetailerProduct
+from app.models.competitor_product import CompetitorProduct
 
 from app.services.competitor_service import (
     upsert_competitor_product, get_all_competitor_products,
@@ -20,6 +22,8 @@ def create_competitor(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    if not db.query(RetailerProduct).filter_by(user_id=current_user.id, catalog_product_id=request.catalog_product_id).first():
+        raise HTTPException(status_code=404, detail="Product not found")
     try:
         return upsert_competitor_product(
             db=db,
@@ -37,11 +41,12 @@ def create_competitor(
 
 @router.get("/competitors", response_model=List[CompetitorProductResponse])
 def get_competitors(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    return get_all_competitor_products(db)
+    owned_catalog_ids = db.query(RetailerProduct.catalog_product_id).filter_by(user_id=current_user.id)
+    return db.query(CompetitorProduct).filter(CompetitorProduct.catalog_product_id.in_(owned_catalog_ids)).all()
 
 @router.get("/competitors/{id}", response_model=CompetitorProductResponse)
 def get_competitor(id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
-    comp = get_competitor_product_by_id(db, id)
+    comp = db.query(CompetitorProduct).join(RetailerProduct, RetailerProduct.catalog_product_id == CompetitorProduct.catalog_product_id).filter(CompetitorProduct.id == id, RetailerProduct.user_id == current_user.id).first()
     if not comp:
         raise HTTPException(status_code=404, detail="Competitor not found")
     return comp
@@ -52,6 +57,9 @@ def add_price_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    owned = db.query(CompetitorProduct).join(RetailerProduct, RetailerProduct.catalog_product_id == CompetitorProduct.catalog_product_id).filter(CompetitorProduct.id == request.competitor_product_id, RetailerProduct.user_id == current_user.id).first()
+    if not owned:
+        raise HTTPException(status_code=404, detail="Competitor not found")
     try:
         return save_price_history(db, request.competitor_product_id, request.price)
     except Exception:
@@ -59,4 +67,7 @@ def add_price_history(
 
 @router.get("/competitor-price-history/{competitor_product_id}", response_model=List[CompetitorPriceHistoryResponse])
 def get_price_history(competitor_product_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    owned = db.query(CompetitorProduct).join(RetailerProduct, RetailerProduct.catalog_product_id == CompetitorProduct.catalog_product_id).filter(CompetitorProduct.id == competitor_product_id, RetailerProduct.user_id == current_user.id).first()
+    if not owned:
+        raise HTTPException(status_code=404, detail="Competitor not found")
     return get_competitor_price_history(db, competitor_product_id)

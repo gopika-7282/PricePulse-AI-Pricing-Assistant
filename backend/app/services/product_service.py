@@ -108,19 +108,8 @@ def create_retailer_product(
     db.commit()
     db.refresh(db_retailer_product)
 
-    # Step 5: Price Analysis and Recommendation
-    # Failure here must NOT rollback already-committed competitor data
-    logger.info(f"[RECOMMENDATION] Started: retailer_product_id={db_retailer_product.id}")
-    try:
-        calculate_price_analysis(db, db_retailer_product.id)
-        generate_recommendation(db, db_retailer_product.id)
-        logger.info(f"[RECOMMENDATION] Succeeded: retailer_product_id={db_retailer_product.id}")
-    except Exception as e:
-        logger.error(
-            f"[RECOMMENDATION] Failed: retailer_product_id={db_retailer_product.id} error='{e}'"
-        )
-        # Competitor data and retailer product already committed — do NOT rollback
-
+    # Recommendation generation is an explicit authenticated workflow action;
+    # product creation never inserts an unchecked recommendation.
     return db_retailer_product
 
 

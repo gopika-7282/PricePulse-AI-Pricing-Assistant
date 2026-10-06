@@ -435,9 +435,11 @@ class MyntraScraper(BaseScraper):
         search_url = f"https://www.myntra.com/{encoded_query}"
 
         logger.info(f"[MYNTRA_SCRAPING_STARTED] Navigating to search URL: {search_url}")
+        self.search_result_status = "PARSE_ERROR"
         nav_ok = await self.safe_navigate(page, search_url, wait_until="domcontentloaded")
 
         if not nav_ok:
+            self.search_result_status = self.last_navigation_status or "NETWORK_ERROR"
             logger.error("[MYNTRA_SCRAPING_FAILED] reason=page_navigation_error")
             return [], False
 
@@ -448,6 +450,7 @@ class MyntraScraper(BaseScraper):
         html = await page.content()
 
         if not html or len(html) < 500:
+            self.search_result_status = self.last_navigation_status or "PARSE_ERROR"
             logger.error("[MYNTRA_SCRAPING_FAILED] reason=empty_page_content")
             return [], False
 
@@ -459,6 +462,8 @@ class MyntraScraper(BaseScraper):
 
         logger.info("[MYNTRA_PAGE_RENDERED] Search page content captured successfully.")
         candidates = _parse_myntra_search_page(html)
+        if not candidates:
+            self.search_result_status = self.last_navigation_status or self.classify_empty_search(html)
         logger.info(f"[MYNTRA_DATA_EXTRACTED] Search page candidates discovered: {len(candidates)}")
         return candidates, False
 
@@ -490,6 +495,7 @@ class MyntraScraper(BaseScraper):
             detail_html = ""
 
         if detail_html and _is_myntra_blocked(detail_html, page.url):
+            self.challenge_detected = True
             logger.warning(f"[MYNTRA_SCRAPING_BLOCKED] Detail page blocked for {cand_url[:60]}")
             detail_html = ""
 
@@ -547,6 +553,7 @@ class MyntraScraper(BaseScraper):
         )
 
         products: List[Dict[str, Any]] = []
+        self.challenge_detected = False
 
         try:
             async with async_playwright() as p:
@@ -569,9 +576,9 @@ class MyntraScraper(BaseScraper):
                         )
                         return {
                             "platform": "Myntra",
-                            "status": "FAILED",
+                            "status": self.search_result_status,
                             "products": [],
-                            "error": "No search results found",
+                            "error": self.search_failure_message(),
                         }
 
                     selected = candidates[:limit]
@@ -584,6 +591,9 @@ class MyntraScraper(BaseScraper):
                         product = await self._fetch_detail_page(page, cand, idx, len(selected))
                         if product and product.get("product_title"):
                             products.append(product)
+
+                    if self.challenge_detected:
+                        return {"platform": "Myntra", "status": "BLOCKED", "products": [], "error": "Security challenge detected on a product detail page"}
 
                 finally:
                     await self.close_session(browser, context)
@@ -632,16 +642,21 @@ class MyntraScraper(BaseScraper):
                 result = await self.scrape_myntra(
                     product_name, category, product_details, max_products
                 )
+                status = self.classify_status(result.get("status"), result.get("error"))
+                result = {**result, "status": status}
                 last_result = result
 
-                if result.get("status") == "BLOCKED":
+                if status == "BLOCKED":
                     logger.warning(
                         f"[MYNTRA_SCRAPING_BLOCKED] Platform blocked on attempt {attempt_num}. "
                         "Not retrying immediately."
                     )
                     return result
 
-                if result.get("status") == "OK" and result.get("products"):
+                if status == "SUCCESS" and result.get("products"):
+                    return result
+
+                if status not in {"NETWORK_ERROR", "TIMEOUT"}:
                     return result
 
                 logger.warning(
@@ -649,12 +664,15 @@ class MyntraScraper(BaseScraper):
                     f"{'Retrying...' if attempt_num < self.max_retries else 'All attempts exhausted.'}"
                 )
             except Exception as e:
+                status = self.classify_status("FAILED", e)
                 last_result = {
                     "platform": "Myntra",
-                    "status": "FAILED",
+                    "status": status,
                     "products": [],
                     "error": str(e),
                 }
+                if status not in {"NETWORK_ERROR", "TIMEOUT"}:
+                    return last_result
                 logger.warning(f"[MYNTRA_SCRAPER] Attempt {attempt_num} raised exception: {e}")
 
             if attempt_num < self.max_retries:

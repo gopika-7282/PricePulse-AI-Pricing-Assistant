@@ -36,6 +36,7 @@ from tenacity import (
 
 from scraping.base_scraper import BaseScraper
 from scraping.parser import parse_search_page, parse_detail_page, clean_flipkart_url
+from scraping.query_builder import focused_product_query
 
 logger = logging.getLogger(__name__)
 
@@ -77,10 +78,7 @@ def build_flipkart_query(
     Focused query builder: 2-3 focused terms from product name and type.
     Avoids long description dumping.
     """
-    clean_name = re.sub(r"\b\d+\s*(?:ml|gm|g|kg|l|oz|pack)\b", "", product_name, flags=re.IGNORECASE)
-    clean_name = re.sub(r"['’]", "", clean_name).strip()
-    words = [w for w in clean_name.split() if len(w) >= 3 and w.lower() not in {"and", "for", "the", "with", "all", "our"}]
-    focused = " ".join(words[:4]) if words else product_name.strip()
+    focused = focused_product_query(product_name, category, product_details)
     logger.info(f"[FLIPKART_SCRAPER] Focused search query built: '{focused}'")
     return focused
 
@@ -120,9 +118,11 @@ class FlipkartScraper(BaseScraper):
         search_url = f"https://www.flipkart.com/search?q={encoded_query}"
 
         logger.info(f"[FLIPKART_SCRAPING_STARTED] Navigating to search URL: {search_url}")
+        self.search_result_status = "PARSE_ERROR"
         nav_ok = await self.safe_navigate(page, search_url, wait_until="domcontentloaded")
 
         if not nav_ok:
+            self.search_result_status = self.last_navigation_status or "NETWORK_ERROR"
             logger.error("[FLIPKART_SCRAPING_FAILED] reason=page_navigation_error")
             return [], False
 
@@ -134,6 +134,7 @@ class FlipkartScraper(BaseScraper):
         current_url = page.url
         html = await page.content()
         if not html or len(html) < 500:
+            self.search_result_status = self.last_navigation_status or "PARSE_ERROR"
             logger.error("[FLIPKART_SCRAPING_FAILED] reason=empty_page_content")
             return [], False
 
@@ -145,6 +146,8 @@ class FlipkartScraper(BaseScraper):
 
         logger.info("[PAGE_RENDERED] Search page content captured successfully.")
         candidates = parse_search_page(html, query=query)
+        if not candidates:
+            self.search_result_status = self.last_navigation_status or self.classify_empty_search(html)
         logger.info(f"[DATA_EXTRACTED] Search page candidates discovered: {len(candidates)}")
         return candidates, False
 
@@ -249,9 +252,9 @@ class FlipkartScraper(BaseScraper):
                         )
                         return {
                             "platform": "Flipkart",
-                            "status": "EMPTY",
+                            "status": self.search_result_status,
                             "products": [],
-                            "error": "Empty search results",
+                            "error": self.search_failure_message(),
                         }
 
                     selected = candidates[:limit]
@@ -318,20 +321,24 @@ class FlipkartScraper(BaseScraper):
                 if not isinstance(res, dict):
                     res = {"platform": "Flipkart", "status": "SUCCESS" if res else "EMPTY", "products": res or []}
 
-                status = res.get("status")
-                if status in ("SUCCESS", "BLOCKED"):
+                status = self.classify_status(res.get("status"), res.get("error"))
+                res = {**res, "status": status}
+                if status in {"SUCCESS", "BLOCKED", "EMPTY", "PARSE_ERROR"}:
                     return res
 
+                if status not in {"NETWORK_ERROR", "TIMEOUT"}:
+                    return res
                 if attempt_num < self.max_retries:
                     import asyncio
                     await asyncio.sleep(2 ** attempt_num)
                 else:
                     return res
             except Exception as e:
-                if attempt_num >= self.max_retries:
+                status = self.classify_status("FAILED", e)
+                if status not in {"NETWORK_ERROR", "TIMEOUT"} or attempt_num >= self.max_retries:
                     return {
                         "platform": "Flipkart",
-                        "status": "PARSE_ERROR",
+                        "status": status,
                         "products": [],
                         "error": str(e),
                     }

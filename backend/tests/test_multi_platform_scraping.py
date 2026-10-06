@@ -395,7 +395,7 @@ class TestPlatformIsolation:
             result = await scout.get_platform_statuses("Hibiscus Hair Oil", "Hair Care")
 
         assert result["platform_statuses"]["Amazon"] == "BLOCKED"
-        assert result["platform_statuses"]["Flipkart"] == "OK"
+        assert result["platform_statuses"]["Flipkart"] == "SUCCESS"
         assert len(result["products"]) == 12  # 5 + 3 + 4
         assert "Amazon" in result["blocked_platforms"]
         assert "Flipkart" not in result["blocked_platforms"]
@@ -445,7 +445,7 @@ class TestPlatformIsolation:
 
             result = await scout.get_platform_statuses("Vitamin C Serum")
 
-        assert result["platform_statuses"]["Amazon"] == "FAILED"
+        assert result["platform_statuses"]["Amazon"] == "PARSE_ERROR"
         assert result["total_products"] == 21  # 8 + 7 + 6
         assert "Amazon" in result["failed_platforms"]
 
@@ -476,7 +476,7 @@ class TestPlatformIsolation:
 
         assert result["total_products"] == 12  # 5 + 4 + 3
         assert "Amazon" in result.get("failed_platforms", []) or \
-               result["platform_statuses"].get("Amazon") == "FAILED"
+               result["platform_statuses"].get("Amazon") == "PARSE_ERROR"
 
 
 # ===========================================================================
@@ -564,7 +564,7 @@ class TestBlockRetryBehavior:
             result = await scraper.scrape_amazon_with_retry("Test Product")
 
         assert call_count == 3
-        assert result["status"] == "OK"
+        assert result["status"] == "SUCCESS"
         assert len(result["products"]) == 1
 
 
@@ -700,9 +700,9 @@ class TestSpecificProducts:
 
         # Amazon blocked -- 3 platforms OK
         assert result["platform_statuses"]["Amazon"] == "BLOCKED"
-        assert result["platform_statuses"]["Flipkart"] == "OK"
-        assert result["platform_statuses"]["Myntra"] == "OK"
-        assert result["platform_statuses"]["Meesho"] == "OK"
+        assert result["platform_statuses"]["Flipkart"] == "SUCCESS"
+        assert result["platform_statuses"]["Myntra"] == "SUCCESS"
+        assert result["platform_statuses"]["Meesho"] == "SUCCESS"
 
         # Total = 7 + 5 + 9 = 21
         assert result["total_products"] == 21
