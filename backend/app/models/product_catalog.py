@@ -1,7 +1,7 @@
 from sqlalchemy import Column, Integer, String, Text, DateTime
 from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
-from datetime import datetime, timezone
+from sqlalchemy.orm import relationship, validates
+from sqlalchemy import event
 from app.database import Base
 
 class ProductCatalog(Base):
@@ -14,6 +14,9 @@ class ProductCatalog(Base):
     product_details = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    last_scraped_at = Column(DateTime(timezone=True), nullable=True)
+    scraping_status = Column(String, default="NEVER_SCRAPED", nullable=False)
 
     retailer_products = relationship("RetailerProduct", back_populates="catalog_product", cascade="all, delete-orphan")
     competitor_products = relationship("CompetitorProduct", back_populates="catalog_product", cascade="all, delete-orphan")
+

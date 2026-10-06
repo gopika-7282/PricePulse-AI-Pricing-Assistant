@@ -9,6 +9,6 @@ class CompetitorPriceHistoryResponse(BaseModel):
     id: int
     competitor_product_id: int
     price: float
-    recorded_at: datetime
+    scraped_at: datetime
 
     model_config = ConfigDict(from_attributes=True)

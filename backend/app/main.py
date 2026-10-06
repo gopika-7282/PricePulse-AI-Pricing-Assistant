@@ -1,9 +1,11 @@
 from fastapi import FastAPI
 from app.database import engine, Base
 import app.models
-
+import logging
 
 from fastapi import FastAPI, Request
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="PricePulse API",
@@ -13,9 +15,10 @@ app = FastAPI(
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    print(f"DEBUG REQ: {request.method} {request.url.path}")
-    print(f"DEBUG HEADERS: {request.headers.get('authorization')}")
+    # Log method and path only — never log Authorization headers or tokens
+    logger.debug(f"REQ: {request.method} {request.url.path}")
     response = await call_next(request)
+    logger.debug(f"RSP: {request.method} {request.url.path} status={response.status_code}")
     return response
 
 from app.routes.auth import router as auth_router

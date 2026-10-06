@@ -7,11 +7,9 @@ class CompetitorProductCreate(BaseModel):
     platform_name: str
     product_name: str
     product_url: Optional[str] = None
-    seller_name: Optional[str] = None
     product_details: Optional[str] = None
     price: float
     rating: Optional[float] = None
-    review_count: Optional[int] = None
     availability: bool = True
 
 class CompetitorProductResponse(BaseModel):
@@ -21,7 +19,6 @@ class CompetitorProductResponse(BaseModel):
     product_name: str
     price: float
     rating: Optional[float] = None
-    review_count: Optional[int] = None
     availability: bool
     scraped_at: datetime
 

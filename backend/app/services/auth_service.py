@@ -1,6 +1,7 @@
 from sqlalchemy.orm import Session
 from fastapi import HTTPException, Depends, status
 from jose import jwt, JWTError
+import logging
 
 from app.models.user import User
 from app.schemas.auth import UserRegisterRequest
@@ -17,6 +18,8 @@ from app.utils.security import (
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.config import SECRET_KEY, ALGORITHM
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -45,9 +48,11 @@ def create_user(
         user:UserRegisterRequest
 ):
 
+    # Normalize email to prevent case/whitespace mismatch
+    normalized_email = user.email.strip().lower()
 
     existing_user=db.query(User).filter(
-        User.email==user.email
+        User.email==normalized_email
     ).first()
 
 
@@ -67,7 +72,7 @@ def create_user(
 
     new_user = User(
         retailer_name=user.retailer_name,
-        email=user.email,
+        email=normalized_email,
 
         password_hash=hashed_password,
 
@@ -100,27 +105,33 @@ def authenticate_user(
         password:str
 ):
 
+    # Normalize email to match registration
+    normalized_email = email.strip().lower()
+    logger.info(f"Login email: {normalized_email}")
 
+    # Order by id desc to handle any old duplicate records
     user=db.query(User).filter(
-        User.email==email
-    ).first()
-
-
+        User.email==normalized_email
+    ).order_by(User.id.desc()).first()
+    
+    user_exists = user is not None
+    logger.info(f"User exists: {user_exists}")
 
     if not user:
-
         return None
 
+    # Verify if hash format is valid bcrypt (starts with $2b$ or $2a$)
+    hash_valid = user.password_hash.startswith('$2') if user.password_hash else False
+    logger.info(f"Hash format valid: {hash_valid}")
 
-
-    if not verify_password(
+    password_valid = verify_password(
         password,
         user.password_hash
-    ):
+    )
+    logger.info(f"Password verification result: {password_valid}")
 
+    if not password_valid:
         return None
-
-
 
     return user
 

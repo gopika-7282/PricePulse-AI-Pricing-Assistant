@@ -1,39 +1,81 @@
-# PricePulse - AI-Powered Pricing Intelligence Assistant
+# PricePulse — Agentic AI Pricing Intelligence Assistant
 
 ## Overview
 
-PricePulse is an Agentic AI-based pricing assistant that helps e-commerce retailers make intelligent pricing decisions by analyzing market data, competitor prices, and demand trends.
+PricePulse is an Agentic AI-powered pricing intelligence platform designed
+for small and growing e-commerce retailers.
 
-The system aims to provide explainable and profit-aware price recommendations using Artificial Intelligence, Machine Learning, and multi-agent workflows.
+It automatically identifies products, retrieves relevant catalog candidates,
+checks data freshness, collects live competitor prices from marketplaces,
+analyzes market conditions, and generates explainable profit-aware pricing
+recommendations.
+
+The system combines:
+
+- Agentic AI
+- LangGraph
+- Qwen via Ollama
+- PostgreSQL
+- RAG
+- Live marketplace scraping
+- React
+- FastAPI
+
+The goal is to provide intelligent pricing capabilities without the
+complexity, platform lock-in, and cost of traditional enterprise pricing
+solutions.
 
 ---
 
 ## Project Status
 
-🚧 Currently under development
+🚧 Under active development
+
+The current development focus is the complete end-to-end Agentic AI workflow,
+including product identity, catalog lifecycle, freshness management,
+marketplace scraping, RAG, pricing agents, and React integration.
 
 ---
 
-## Planned Technologies
+## Core Workflow
 
-- Frontend: React / Next.js
-- Backend: FastAPI
-- AI Framework: LangGraph + LangChain
-- LLM: Ollama (Local LLM)
-- Models: Llama 3 / Qwen / Mistral
-- Database: PostgreSQL
-- Vector Database: ChromaDB
-- Machine Learning: Prophet, Reinforcement Learning
-- Deployment: Docker, Kubernetes, GitHub Actions
-
----
-
-## Project Goal
-
-To build an intelligent pricing assistant that enables small retailers to make competitive pricing decisions without expensive enterprise solutions.
-
----
-
-## Author
-
-Gopika G
+```text
+Retailer
+   ↓
+React Frontend
+   ↓
+FastAPI
+   ↓
+LangGraph Orchestrator
+   ↓
+Product Identity Agent
+   ↓
+PostgreSQL Candidate Retrieval
+   ↓
+Qwen
+   ↓
+MATCH / UNCERTAIN / NOT_MATCH
+   ↓
+Catalog + Freshness Lifecycle
+   ↓
+Scout Agent
+   ↓
+Live Marketplace Tools
+   ├── Flipkart
+   ├── Amazon
+   ├── Myntra
+   └── Meesho
+   ↓
+Competitor Data
+   ↓
+RAG Retrieval
+   ↓
+Strategist Agent
+   ↓
+Compliance Agent
+   ↓
+Price Recommendation
+   ↓
+PostgreSQL
+   ↓
+React Dashboard

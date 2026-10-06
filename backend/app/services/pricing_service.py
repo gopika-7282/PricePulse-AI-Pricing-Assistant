@@ -3,10 +3,21 @@ from app.models.retailer_product import RetailerProduct
 from app.models.competitor_product import CompetitorProduct
 from app.models.price_analysis import PriceAnalysis
 from app.models.recommendation import Recommendation
+from app.services.ai.competitor_filter_service import filter_relevant_competitors
 from typing import Optional
+import logging
+
+logger = logging.getLogger(__name__)
 
 def calculate_market_average(db: Session, catalog_product_id: int) -> dict:
-    competitors = db.query(CompetitorProduct).filter(CompetitorProduct.catalog_product_id == catalog_product_id).all()
+    all_competitors = db.query(CompetitorProduct).filter(CompetitorProduct.catalog_product_id == catalog_product_id).all()
+    
+    logger.info(f"[PRICING_INPUT_UPDATED] catalog_product_id={catalog_product_id} raw_competitor_count={len(all_competitors)}")
+    
+    competitors = filter_relevant_competitors(db, catalog_product_id, all_competitors)
+    
+    logger.info(f"[PRICING_ANALYSIS_COMPLETED] catalog_product_id={catalog_product_id} filtered_competitor_count={len(competitors)}")
+    
     if not competitors:
         return {
             "average": 0.0,

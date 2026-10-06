@@ -16,5 +16,7 @@ class ProductCatalogResponse(BaseModel):
     product_details: Optional[str] = None
     created_at: datetime
     updated_at: datetime
+    last_scraped_at: Optional[datetime] = None
+    scraping_status: str
 
     model_config = ConfigDict(from_attributes=True)

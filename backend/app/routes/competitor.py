@@ -6,7 +6,7 @@ from app.services.auth_service import get_db, get_current_user
 from app.models.user import User
 
 from app.services.competitor_service import (
-    create_competitor_product, get_all_competitor_products,
+    upsert_competitor_product, get_all_competitor_products,
     get_competitor_product_by_id, save_price_history, get_competitor_price_history
 )
 from app.schemas.competitor_product import CompetitorProductCreate, CompetitorProductResponse
@@ -21,17 +21,15 @@ def create_competitor(
     current_user: User = Depends(get_current_user)
 ):
     try:
-        return create_competitor_product(
+        return upsert_competitor_product(
             db=db,
             catalog_product_id=request.catalog_product_id,
             platform_name=request.platform_name,
             product_name=request.product_name,
             price=request.price,
             product_url=request.product_url,
-            seller_name=request.seller_name,
             product_details=request.product_details,
             rating=request.rating,
-            review_count=request.review_count,
             availability=request.availability
         )
     except Exception:
