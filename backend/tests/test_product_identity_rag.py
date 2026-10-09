@@ -53,6 +53,7 @@ from app.models.product_catalog import ProductCatalog
 from app.services.product_identity_service import (
     evaluate_product_identity,
     IdentityDecision,
+    IdentityServiceUnavailable,
     retrieve_postgres_candidates,
     extract_search_tokens,
 )
@@ -149,6 +150,13 @@ class TestPostgresCandidateRetrieval:
         candidates = retrieve_postgres_candidates(db, "Turmeric Soap", limit=5)
         assert len(candidates) <= 5
 
+    def test_product_identity_ranks_above_brand_similarity(self, db):
+        """Product name/type dominate a same-brand but different product."""
+        make_catalog(db, "Hibiscus Hair Oil", brand="Brand A", details="Hibiscus oil for hair")
+        make_catalog(db, "Hibiscus Hair Serum", brand="Brand B", details="Hibiscus leave-in serum")
+        candidates = retrieve_postgres_candidates(db, "Hibiscus Hair Oil", brand="Brand B")
+        assert candidates[0].name == "Hibiscus Hair Oil"
+
     def test_category_filtering(self, db):
         """Category match should boost candidate retrieval."""
         make_catalog(db, "Goat Milk Soap", category="Personal Care", details="handmade soap")
@@ -220,10 +228,13 @@ class TestProductIdentityAgent:
         """MATCH: Identical name and description."""
         cat = make_catalog(db, "Turmeric Soap", details="Natural herbal turmeric soap 100g")
         with patch("app.services.product_identity_service.generate_structured",
-                   return_value=self._mock_llm_match(cat.id)):
+                   return_value=self._mock_llm_match(cat.id)) as generate:
             result = evaluate_product_identity(
                 db, "Turmeric Soap", product_details="Natural herbal turmeric soap 100g"
             )
+        from app.config import OLLAMA_IDENTITY_TIMEOUT
+        assert generate.call_args.kwargs["timeout"] == OLLAMA_IDENTITY_TIMEOUT
+        assert generate.call_args.kwargs["operation"] == "product_identity"
         assert result.decision == IdentityDecision.MATCH_EXISTING
         assert result.matched_catalog_id == cat.id
         assert result.confidence >= 0.9
@@ -331,20 +342,25 @@ class TestProductIdentityAgent:
             )
         assert result.decision == IdentityDecision.UNCERTAIN_MATCH
 
+    def test_uncertain_identity_is_a_valid_new_catalog_outcome(self, db):
+        """A genuine uncertain decision is left for LangGraph's catalog node to create."""
+        make_catalog(db, "Hibiscus Hair Oil", details="Hibiscus oil for hair")
+        with patch("app.services.product_identity_service.generate_structured",
+                   return_value=self._mock_llm_uncertain()):
+            result = evaluate_product_identity(db, "Hibiscus Hair Oil for Hair", product_details="Hibiscus oil")
+        assert result.decision == IdentityDecision.UNCERTAIN_MATCH
+
     # ------------------------------------------------------------------
     # LLM Failure Fallback
     # ------------------------------------------------------------------
 
-    def test_llm_failure_falls_back_to_uncertain(self, db):
-        """LLM unavailable -> should fall back to UNCERTAIN_MATCH (never crash)."""
+    def test_llm_failure_is_not_falsely_classified_as_uncertain(self, db):
+        """Model unavailability is a service error, not an identity decision."""
         make_catalog(db, "Hibiscus Hair Oil", details="Herbal hair oil")
         with patch("app.services.product_identity_service.generate_structured",
-                   return_value={"success": False, "data": None, "error": "Ollama unavailable"}):
-            result = evaluate_product_identity(
-                db, "Hair Oil", product_details="Herbal hair oil"
-            )
-        assert result.decision == IdentityDecision.UNCERTAIN_MATCH
-        assert result.confidence == 0.0
+                   return_value={"success": False, "data": None, "error": "Ollama unavailable"}), \
+                pytest.raises(IdentityServiceUnavailable):
+            evaluate_product_identity(db, "Hair Oil", product_details="Herbal hair oil")
 
     def test_empty_catalog_returns_new_product(self, db):
         """Empty catalog -> always NEW_PRODUCT without LLM call."""
@@ -353,8 +369,8 @@ class TestProductIdentityAgent:
         )
         assert result.decision == IdentityDecision.NEW_PRODUCT
 
-    def test_invalid_llm_id_rejected(self, db):
-        """LLM returns ID not in candidate set -> forced UNCERTAIN_MATCH."""
+    def test_invalid_llm_id_is_a_controlled_service_error(self, db):
+        """A hallucinated candidate is not accepted as MATCH or relabeled uncertain."""
         cat = make_catalog(db, "Hibiscus Hair Oil", details="Herbal hair oil")
         fake_id = cat.id + 9999  # ID that does not exist in candidates
         with patch("app.services.product_identity_service.generate_structured",
@@ -368,11 +384,8 @@ class TestProductIdentityAgent:
                            "identity_factors": [],
                        },
                        "error": None,
-                   }):
-            result = evaluate_product_identity(
-                db, "Hair Oil", product_details="Herbal hair oil"
-            )
-        assert result.decision == IdentityDecision.UNCERTAIN_MATCH
+                   }), pytest.raises(IdentityServiceUnavailable):
+            evaluate_product_identity(db, "Hair Oil", product_details="Herbal hair oil")
 
 
 # ============================================================================

@@ -107,8 +107,6 @@ def authenticate_user(
 
     # Normalize email to match registration
     normalized_email = email.strip().lower()
-    logger.info(f"Login email: {normalized_email}")
-
     # Order by id desc to handle any old duplicate records
     user=db.query(User).filter(
         User.email==normalized_email

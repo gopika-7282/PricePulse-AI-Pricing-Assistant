@@ -9,7 +9,7 @@ Requirements & Standardized Format:
 - product_url: non-empty valid HTTP/HTTPS URL string
 - price: float > 0.0
 - rating: float in range [0.0, 5.0], or None
-- availability: boolean
+- availability: boolean when observed, otherwise None
 - scraped_at: ISO-8601 string timestamp
 
 If validation fails for any mandatory field, the record is rejected and VALIDATION_FAILED log is emitted.
@@ -33,7 +33,7 @@ class ScrapedProductSchema(BaseModel):
     product_url: str = Field(..., min_length=1, description="Cleaned product page URL")
     price: float = Field(..., gt=0, description="Product price in INR (must be > 0)")
     rating: Optional[float] = Field(default=None, description="Product rating [0.0 - 5.0]")
-    availability: bool = Field(default=True, description="Stock availability status")
+    availability: Optional[bool] = Field(default=None, description="Stock availability when explicitly reported")
     scraped_at: str = Field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(),
         description="ISO-8601 UTC timestamp of scraping execution"
@@ -42,6 +42,11 @@ class ScrapedProductSchema(BaseModel):
         default_factory=list,
         description="Scraped product details or specifications"
     )
+    quantity_value: Optional[float] = Field(default=None, gt=0)
+    quantity_unit: Optional[str] = None
+    pack_count: Optional[int] = Field(default=None, gt=0)
+    total_quantity: Optional[float] = Field(default=None, gt=0)
+    total_quantity_unit: Optional[str] = None
 
     @field_validator("platform", "product_title", "product_url", mode="before")
     @classmethod
@@ -90,9 +95,12 @@ def validate_scraped_product(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "product_url": data.get("product_url"),
         "price": data.get("price"),
         "rating": data.get("rating"),
-        "availability": data.get("availability", True),
+        "availability": data.get("availability"),
         "scraped_at": data.get("scraped_at") or datetime.now(timezone.utc).isoformat(),
         "product_details": data.get("product_details", []),
+        "quantity_value": data.get("quantity_value"), "quantity_unit": data.get("quantity_unit"),
+        "pack_count": data.get("pack_count"), "total_quantity": data.get("total_quantity"),
+        "total_quantity_unit": data.get("total_quantity_unit"),
     }
 
     try:

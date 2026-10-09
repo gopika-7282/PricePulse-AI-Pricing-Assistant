@@ -14,6 +14,8 @@ Responsibilities:
 import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlsplit
+import re
 from playwright.async_api import (
     async_playwright,
     Browser,
@@ -78,8 +80,64 @@ class BaseScraper:
         page = await context.new_page()
         return browser, context, page
 
+    @staticmethod
+    def _safe_url_location(url: Optional[str]) -> Tuple[str, str]:
+        """Return only a URL's host and path; omit credentials and query data."""
+        try:
+            parsed = urlsplit(str(url or ""))
+            host = parsed.hostname or "unknown"
+            path = parsed.path or "/"
+            return (re.sub(r"[\r\n\t]", "", host)[:120],
+                    re.sub(r"[\r\n\t]", "", path)[:240])
+        except (TypeError, ValueError):
+            return "unknown", "/"
+
+    def log_diagnostic(
+        self,
+        platform: str,
+        stage: str,
+        *,
+        requested_url: Optional[str] = None,
+        final_url: Optional[str] = None,
+        navigation: Optional[str] = None,
+        exception: Optional[BaseException] = None,
+        challenge: Optional[bool] = None,
+        challenge_reason: Optional[str] = None,
+        product_card_count: Optional[int] = None,
+        normalized_product_count: Optional[int] = None,
+        final_status: Optional[str] = None,
+        reason_category: Optional[str] = None,
+    ) -> None:
+        requested_host, _ = self._safe_url_location(requested_url)
+        final_host, final_path = self._safe_url_location(final_url)
+        logger.info(
+            "[SCRAPER_DIAGNOSTIC] platform=%s stage=%s requested_host=%s final_host=%s final_path=%s "
+            "navigation=%s exception_class=%s challenge=%s challenge_reason=%s "
+            "product_card_count=%s normalized_product_count=%s final_status=%s reason_category=%s",
+            platform, stage, requested_host, final_host, final_path,
+            navigation or "not_applicable", type(exception).__name__ if exception else "none",
+            str(challenge).lower() if challenge is not None else "not_checked",
+            challenge_reason or "none",
+            product_card_count if product_card_count is not None else "not_measured",
+            normalized_product_count if normalized_product_count is not None else "not_measured",
+            final_status or "not_final", reason_category or "none",
+        )
+
+    @staticmethod
+    def challenge_reason_category(
+        detected: bool, html: str, url: str, url_markers=(), html_markers=()
+    ) -> str:
+        if not detected:
+            return "not_detected"
+        if any(marker.casefold() in (url or "").casefold() for marker in url_markers):
+            return "url_pattern"
+        if any(marker.casefold() in (html or "").casefold() for marker in html_markers):
+            return "html_signal"
+        return "detector_match"
+
     async def safe_navigate(
-        self, page: Page, url: str, wait_until: str = "domcontentloaded", timeout: Optional[int] = None
+        self, page: Page, url: str, wait_until: str = "domcontentloaded", timeout: Optional[int] = None,
+        *, platform: str = "unknown", stage: str = "search",
     ) -> bool:
         """
         Safely navigate to a URL with timeout fallback handling.
@@ -90,17 +148,30 @@ class BaseScraper:
         self.last_navigation_error = None
         try:
             await page.goto(url, wait_until=wait_until, timeout=t)
+            self.log_diagnostic(platform, stage, requested_url=url, final_url=getattr(page, "url", None),
+                                navigation="success")
             return True
-        except PlaywrightTimeoutError:
+        except PlaywrightTimeoutError as e:
             self.last_navigation_status = "TIMEOUT"
             self.last_navigation_error = "Navigation timed out"
-            logger.warning(f"[BASE_SCRAPER] Timeout loading {url}. Continuing with rendered DOM.")
+            self.log_diagnostic(platform, stage, requested_url=url, final_url=getattr(page, "url", None),
+                                navigation="timeout_fallback", exception=e, reason_category="timeout")
             return True
         except Exception as e:
             self.last_navigation_status = "NETWORK_ERROR"
             self.last_navigation_error = str(e)
-            logger.error(f"[BASE_SCRAPER] Navigation failed for {url}: {e}")
+            self.log_diagnostic(platform, stage, requested_url=url, final_url=getattr(page, "url", None),
+                                navigation="failure", exception=e, reason_category="network_failure")
             return False
+
+    @staticmethod
+    def result_reason_category(status: str) -> str:
+        return {
+            "SUCCESS": "success", "OK": "success", "BLOCKED": "challenge_detected",
+            "TIMEOUT": "timeout", "NETWORK_ERROR": "network_failure",
+            "PARSE_ERROR": "parser_failure", "EMPTY": "no_products",
+            "FAILED": "scraper_failure",
+        }.get(str(status or "").upper(), "unknown")
 
     @staticmethod
     def classify_empty_search(html: str) -> str:
@@ -113,9 +184,11 @@ class BaseScraper:
         if self.search_result_status == "EMPTY":
             return "No matching products were returned by the marketplace."
         if self.search_result_status == "TIMEOUT":
-            return "Marketplace navigation timed out."
+            detail = f" Details: {self.last_navigation_error}" if self.last_navigation_error else ""
+            return f"Marketplace navigation timed out.{detail}"
         if self.search_result_status == "NETWORK_ERROR":
-            return "Marketplace connection failed during navigation."
+            detail = f" Details: {self.last_navigation_error}" if self.last_navigation_error else ""
+            return f"Marketplace connection failed during navigation.{detail}"
         return "The search page loaded, but its product cards could not be parsed."
 
     @staticmethod
@@ -136,7 +209,7 @@ class BaseScraper:
                 await page.evaluate("window.scrollBy(0, window.innerHeight)")
                 await page.wait_for_timeout(delay_ms)
             except Exception as e:
-                logger.debug(f"[BASE_SCRAPER] Scroll interrupted: {e}")
+                logger.debug("[BASE_SCRAPER] Scroll interrupted: exception_class=%s", type(e).__name__)
                 break
 
     async def close_session(self, browser: Optional[Browser], context: Optional[BrowserContext] = None) -> None:

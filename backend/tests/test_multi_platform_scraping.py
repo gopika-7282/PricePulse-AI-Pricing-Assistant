@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 
 from scraping.amazon_scraper import (
     AmazonScraper,
+    select_amazon_candidates,
     build_amazon_query,
     _is_amazon_blocked,
     _parse_amazon_search_page,
@@ -90,13 +91,21 @@ def _make_platform_result(platform: str, status: str, count: int = 5) -> Dict[st
             "products": [],
             "error": "Automation challenge detected",
         }
-    else:
-        return {
-            "platform": platform,
-            "status": "FAILED",
-            "products": [],
-            "error": "Scraping error",
-        }
+    return {
+        "platform": platform,
+        "status": "FAILED",
+        "products": [],
+        "error": "Scraping error",
+    }
+
+
+def _use_candidate_passthrough(monkeypatch):
+    """Keep platform orchestration tests independent from live Qwen relevance calls."""
+    monkeypatch.setattr(
+        "scraping.scout.process_platform_pipeline",
+        lambda platform_name, target_name, target_category, raw_products, max_products=10:
+            (raw_products[:max_products], {"final": min(len(raw_products), max_products)}),
+    )
 
 
 # ===========================================================================
@@ -203,6 +212,27 @@ class TestBlockDetection:
         html = "<html><body><div data-testid='product-container'>Item</div></body></html>"
         assert _is_meesho_blocked(html) is False
 
+    @pytest.mark.asyncio
+    async def test_meesho_short_access_denied_page_is_classified_as_blocked(self):
+        scraper = MeeshoScraper(max_retries=1)
+
+        class ShortDeniedPage:
+            url = "https://www.meesho.com/search?q=aloe%20vera%20gel"
+
+            async def wait_for_timeout(self, _milliseconds):
+                return None
+
+            async def content(self):
+                return "<html><title>Access Denied</title><body>Access Denied</body></html>"
+
+        scraper.safe_navigate = AsyncMock(return_value=True)
+        scraper.scroll_page = AsyncMock()
+        products, blocked = await scraper._fetch_search_candidates(ShortDeniedPage(), "aloe vera gel")
+
+        assert products == []
+        assert blocked is True
+        assert scraper.search_result_status == "BLOCKED"
+
     def test_empty_html_not_blocked(self):
         """Empty HTML should not be treated as blocked (it's a different failure mode)."""
         assert _is_amazon_blocked("") is False
@@ -230,7 +260,7 @@ class TestNormalizedOutput:
             f"Expected platform='{expected_platform}', got '{product['platform']}'"
         assert isinstance(product["price"], float), "price must be float"
         assert product["price"] >= 0, "price must be non-negative"
-        assert isinstance(product["availability"], bool), "availability must be bool"
+        assert product["availability"] is None or isinstance(product["availability"], bool), "availability must be bool or unknown"
         if product.get("rating") is not None:
             assert 0.0 <= product["rating"] <= 5.0, "rating must be [0.0, 5.0]"
 
@@ -288,6 +318,13 @@ class TestNormalizedOutput:
         assert len(validated) == 1
         assert validated[0]["rating"] is None
 
+    def test_missing_availability_is_not_fabricated_as_in_stock(self):
+        p = _make_product("Amazon")
+        p.pop("availability")
+        validated = validate_products([p])
+        assert len(validated) == 1
+        assert validated[0]["availability"] is None
+
     def test_blocked_sentinel_skipped(self):
         """Blocked sentinel dicts are silently skipped during validation."""
         items = [
@@ -327,41 +364,22 @@ class TestMaxProductsCap:
         validated = validate_products(products)
         assert len(validated) == 10
 
-    @pytest.mark.asyncio
-    async def test_amazon_scraper_respects_max(self):
-        """AmazonScraper.scrape_amazon enforces the 10-product limit."""
-        scraper = AmazonScraper()
-
-        # Mock the browser session so we don't hit the real network
+    def test_amazon_scraper_respects_max(self):
+        """The production selector applies the cap after generic validation/relevance."""
         twenty_candidates = [_make_product("Amazon", i) for i in range(1, 21)]
-        # Rename product_title to product_title (already correct in _make_product)
-
-        async def mock_fetch_search(*args, **kwargs):
-            return twenty_candidates, False  # 20 candidates, not blocked
-
-        async def mock_fetch_detail(page, cand, idx, total):
-            return cand  # Return candidate as-is
-
-        with patch.object(scraper, "_fetch_search_candidates", mock_fetch_search), \
-             patch.object(scraper, "_fetch_detail_page", mock_fetch_detail), \
-             patch("scraping.amazon_scraper.async_playwright") as mock_pw:
-            # Mock the playwright context manager
-            mock_browser = AsyncMock()
-            mock_context = AsyncMock()
-            mock_page = AsyncMock()
-            mock_p = AsyncMock()
-            mock_p.chromium.launch = AsyncMock(return_value=mock_browser)
-            mock_browser.new_context = AsyncMock(return_value=mock_context)
-            mock_context.new_page = AsyncMock(return_value=mock_page)
-            mock_pw.return_value.__aenter__ = AsyncMock(return_value=mock_p)
-            mock_pw.return_value.__aexit__ = AsyncMock(return_value=False)
-
-            result = await scraper.scrape_amazon(
-                "Test Product", max_products=10
-            )
-
-        # With 20 candidates and limit=10, we should get at most 10
-        assert len(result.get("products", [])) <= 10
+        for idx, candidate in enumerate(twenty_candidates, 1):
+            candidate.update({
+                "product_title": f"Hibiscus Hair Oil Variant {idx}",
+                "asin": f"B{idx:09d}",
+            })
+        selected, counts = select_amazon_candidates(
+            twenty_candidates, "Hibiscus Hair Oil", "Hair Care", 10
+        )
+        assert len(selected) == 10
+        assert counts == {
+            "parsed": 20, "unique": 20, "validated": 20,
+            "relevant": 20, "ranked": 20, "selected": 10,
+        }
 
 
 # ===========================================================================
@@ -371,9 +389,10 @@ class TestMaxProductsCap:
 class TestPlatformIsolation:
 
     @pytest.mark.asyncio
-    async def test_amazon_blocked_flipkart_continues(self):
-        """When Amazon is BLOCKED, Flipkart results should still be processed."""
+    async def test_early_platform_blocks_fall_through_to_later_marketplace(self, monkeypatch):
+        """Blocked preferred platforms fall through to a later marketplace."""
         scout = ScoutScraper()
+        _use_candidate_passthrough(monkeypatch)
 
         async def mock_flipkart(*args, **kwargs):
             return _make_platform_result("Flipkart", "OK", count=5)
@@ -382,22 +401,25 @@ class TestPlatformIsolation:
             return _make_platform_result("Amazon", "BLOCKED")
 
         async def mock_myntra(*args, **kwargs):
-            return _make_platform_result("Myntra", "OK", count=3)
+            return _make_platform_result("Myntra", "BLOCKED")
 
         async def mock_meesho(*args, **kwargs):
-            return _make_platform_result("Meesho", "OK", count=4)
+            return _make_platform_result("Meesho", "BLOCKED")
 
         with patch.object(scout, "_run_flipkart", mock_flipkart), \
              patch.object(scout, "_run_amazon", mock_amazon), \
              patch.object(scout, "_run_myntra", mock_myntra), \
              patch.object(scout, "_run_meesho", mock_meesho):
 
-            result = await scout.get_platform_statuses("Hibiscus Hair Oil", "Hair Care")
+            result = await asyncio.wait_for(scout.get_platform_statuses("Hibiscus Hair Oil", "Hair Care"), timeout=2)
 
+        assert result["platform_statuses"]["Myntra"] == "BLOCKED"
+        assert result["platform_statuses"]["Meesho"] == "BLOCKED"
         assert result["platform_statuses"]["Amazon"] == "BLOCKED"
         assert result["platform_statuses"]["Flipkart"] == "SUCCESS"
-        assert len(result["products"]) == 12  # 5 + 3 + 4
-        assert "Amazon" in result["blocked_platforms"]
+        assert len(result["products"]) == 5
+        assert list(result["platform_statuses"]) == ["Myntra", "Meesho", "Amazon", "Flipkart"]
+        assert {"Myntra", "Meesho", "Amazon"}.issubset(result["blocked_platforms"])
         assert "Flipkart" not in result["blocked_platforms"]
 
     @pytest.mark.asyncio
@@ -422,61 +444,58 @@ class TestPlatformIsolation:
         assert result["total_products"] == 0
 
     @pytest.mark.asyncio
-    async def test_one_failed_others_succeed(self):
+    async def test_one_failed_others_succeed(self, monkeypatch):
         """One platform FAILED should not prevent others from succeeding."""
         scout = ScoutScraper()
-
-        async def mock_flipkart(*args, **kwargs):
-            return _make_platform_result("Flipkart", "OK", count=8)
-
-        async def mock_amazon(*args, **kwargs):
-            return _make_platform_result("Amazon", "FAILED")
+        _use_candidate_passthrough(monkeypatch)
 
         async def mock_myntra(*args, **kwargs):
-            return _make_platform_result("Myntra", "OK", count=7)
+            return _make_platform_result("Myntra", "FAILED")
 
         async def mock_meesho(*args, **kwargs):
             return _make_platform_result("Meesho", "OK", count=6)
 
-        with patch.object(scout, "_run_flipkart", mock_flipkart), \
-             patch.object(scout, "_run_amazon", mock_amazon), \
+        async def unexpected(*args, **kwargs):
+            raise AssertionError("fallback should stop after Meesho succeeds")
+
+        with patch.object(scout, "_run_flipkart", unexpected), \
+             patch.object(scout, "_run_amazon", unexpected), \
              patch.object(scout, "_run_myntra", mock_myntra), \
              patch.object(scout, "_run_meesho", mock_meesho):
 
-            result = await scout.get_platform_statuses("Vitamin C Serum")
+            result = await asyncio.wait_for(scout.get_platform_statuses("Vitamin C Serum"), timeout=2)
 
-        assert result["platform_statuses"]["Amazon"] == "PARSE_ERROR"
-        assert result["total_products"] == 21  # 8 + 7 + 6
-        assert "Amazon" in result["failed_platforms"]
+        assert result["platform_statuses"]["Myntra"] == "PARSE_ERROR"
+        assert result["platform_statuses"]["Meesho"] == "SUCCESS"
+        assert result["total_products"] == 6
+        assert "Myntra" in result["failed_platforms"]
 
     @pytest.mark.asyncio
-    async def test_scraper_exception_does_not_propagate(self):
+    async def test_scraper_exception_does_not_propagate(self, monkeypatch):
         """If a scraper raises an unexpected exception, other platforms still run."""
         scout = ScoutScraper()
-
-        async def mock_flipkart(*args, **kwargs):
-            return _make_platform_result("Flipkart", "OK", count=5)
-
-        async def mock_amazon_raises(*args, **kwargs):
-            raise RuntimeError("Unexpected network failure")
+        _use_candidate_passthrough(monkeypatch)
 
         async def mock_myntra(*args, **kwargs):
-            return _make_platform_result("Myntra", "OK", count=4)
+            raise RuntimeError("Unexpected network failure")
 
         async def mock_meesho(*args, **kwargs):
             return _make_platform_result("Meesho", "OK", count=3)
 
-        with patch.object(scout, "_run_flipkart", mock_flipkart), \
-             patch.object(scout, "_run_amazon", mock_amazon_raises), \
+        async def unexpected(*args, **kwargs):
+            raise AssertionError("fallback should stop after Meesho succeeds")
+
+        with patch.object(scout, "_run_flipkart", unexpected), \
+             patch.object(scout, "_run_amazon", unexpected), \
              patch.object(scout, "_run_myntra", mock_myntra), \
              patch.object(scout, "_run_meesho", mock_meesho):
 
             # This must NOT raise
-            result = await scout.get_platform_statuses("Cotton Kurta")
+            result = await asyncio.wait_for(scout.get_platform_statuses("Cotton Kurta"), timeout=2)
 
-        assert result["total_products"] == 12  # 5 + 4 + 3
-        assert "Amazon" in result.get("failed_platforms", []) or \
-               result["platform_statuses"].get("Amazon") == "PARSE_ERROR"
+        assert result["total_products"] == 3
+        assert result["platform_statuses"]["Myntra"] == "NETWORK_ERROR"
+        assert result["platform_statuses"]["Meesho"] == "SUCCESS"
 
 
 # ===========================================================================
@@ -663,27 +682,33 @@ class TestSpecificProducts:
     @pytest.mark.asyncio
     async def test_hibiscus_hair_oil_mock_full_scrape(self):
         """
-        Full mock scrape for Hibiscus Hair Oil.
+        Mock scrape for Hibiscus Hair Oil follows the preferred fallback order.
         Verifies:
-        - All 4 platforms are attempted
+        - Myntra is attempted first
+        - The fallback stops after the first successful normalized result
         - Results have correct platform names
-        - Results count is <= 40 (4 x 10)
+        - Results count is <= 10
         - No hardcoded product titles
         """
         scout = ScoutScraper()
+        called = []
 
         async def flipkart_ok(*args, **kwargs):
+            called.append("Flipkart")
             prods = [_make_product("Flipkart", i) for i in range(1, 8)]
             return {"platform": "Flipkart", "status": "OK", "products": prods}
 
         async def amazon_blocked(*args, **kwargs):
+            called.append("Amazon")
             return {"platform": "Amazon", "status": "BLOCKED", "products": [], "error": "CAPTCHA"}
 
         async def myntra_ok(*args, **kwargs):
+            called.append("Myntra")
             prods = [_make_product("Myntra", i) for i in range(1, 6)]
             return {"platform": "Myntra", "status": "OK", "products": prods}
 
         async def meesho_ok(*args, **kwargs):
+            called.append("Meesho")
             prods = [_make_product("Meesho", i) for i in range(1, 10)]
             return {"platform": "Meesho", "status": "OK", "products": prods}
 
@@ -698,26 +723,16 @@ class TestSpecificProducts:
                 product_details="Natural herbal hair oil with hibiscus extract",
             )
 
-        # Amazon blocked -- 3 platforms OK
-        assert result["platform_statuses"]["Amazon"] == "BLOCKED"
-        assert result["platform_statuses"]["Flipkart"] == "SUCCESS"
+        # Preferred marketplace succeeded, so no fallback was attempted.
         assert result["platform_statuses"]["Myntra"] == "SUCCESS"
-        assert result["platform_statuses"]["Meesho"] == "SUCCESS"
+        assert called == ["Myntra"]
+        assert result["total_products"] == 5
 
-        # Total = 7 + 5 + 9 = 21
-        assert result["total_products"] == 21
-
-        # All products retain their correct platform
+        # The successful products retain their platform identity.
         platforms_found = {p["platform"] for p in result["products"]}
-        assert "Amazon" not in platforms_found  # Amazon was blocked
-        assert "Flipkart" in platforms_found
-        assert "Myntra" in platforms_found
-        assert "Meesho" in platforms_found
+        assert platforms_found == {"Myntra"}
 
-        # Per-platform count <= 10
-        for platform in ["Flipkart", "Myntra", "Meesho"]:
-            count = sum(1 for p in result["products"] if p["platform"] == platform)
-            assert count <= 10, f"{platform} exceeded 10 products: {count}"
+        assert len(result["products"]) <= 10
 
 
 # ===========================================================================
@@ -762,7 +777,7 @@ class TestFlipkartBackwardCompat:
             products = await scout.get_competitor_data("Test Product")
 
         assert isinstance(products, list), "get_competitor_data must return a list"
-        assert len(products) == 10  # 5 + 3 + 1 + 1 = 10 all pass validation
+        assert len(products) == 1  # preferred Myntra result ends the fallback chain
         # All have required fields
         for p in products:
             assert "platform" in p

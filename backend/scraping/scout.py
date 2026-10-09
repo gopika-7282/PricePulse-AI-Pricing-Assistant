@@ -17,6 +17,7 @@ Pipeline:
 
 import asyncio
 import logging
+import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from scraping.flipkart_scraper import FlipkartScraper
@@ -30,6 +31,11 @@ from app.services.relevance_filter_service import filter_candidate_products
 logger = logging.getLogger(__name__)
 
 HARD_MAX_PRODUCTS = 10
+PLATFORM_TIMEOUT_SECONDS = max(5.0, float(os.getenv("MARKETPLACE_TIMEOUT_SECONDS", "25")))
+AMAZON_PLATFORM_TIMEOUT_SECONDS = max(
+    PLATFORM_TIMEOUT_SECONDS,
+    float(os.getenv("AMAZON_MARKETPLACE_TIMEOUT_SECONDS", "180")),
+)
 
 
 def _failure_status(status: str, error: Any = "") -> str:
@@ -129,7 +135,7 @@ class ScoutScraper:
     ) -> Dict[str, Any]:
         """Execute Flipkart scrape with error isolation and pipeline filtering."""
         try:
-            logger.info(f"[SCOUT] Running Flipkart scraper for: '{product_name}'")
+            logger.info("[SCOUT] Running Flipkart scraper")
             res = await self._flipkart.scrape_flipkart_with_retry(
                 product_name=product_name,
                 category=category,
@@ -141,6 +147,9 @@ class ScoutScraper:
 
             status = _failure_status(res.get("status", "EMPTY"), res.get("error"))
             if status in ("BLOCKED", "TIMEOUT", "PARSE_ERROR"):
+                self._flipkart.log_diagnostic("Flipkart", "normalization", final_status=status,
+                                               reason_category=self._flipkart.result_reason_category(status),
+                                               normalized_product_count=0)
                 return {
                     "platform": "Flipkart",
                     "status": status,
@@ -158,6 +167,9 @@ class ScoutScraper:
             )
 
             final_status = "SUCCESS" if valid_prods else "EMPTY"
+            self._flipkart.log_diagnostic("Flipkart", "normalization", final_status=final_status,
+                                           reason_category=self._flipkart.result_reason_category(final_status),
+                                           normalized_product_count=len(valid_prods))
             return {
                 "platform": "Flipkart",
                 "status": final_status,
@@ -165,7 +177,10 @@ class ScoutScraper:
                 "error": None if valid_prods else "No relevant products found",
             }
         except Exception as e:
-            logger.error(f"[SCOUT] Flipkart runner error: {e}", exc_info=True)
+            self._flipkart.log_diagnostic("Flipkart", "normalization", final_status="PARSE_ERROR",
+                                           reason_category="scraper_failure", exception=e,
+                                           normalized_product_count=0)
+            logger.error("[SCOUT] Flipkart runner error: exception_class=%s", type(e).__name__)
             return {"platform": "Flipkart", "status": "PARSE_ERROR", "products": [], "error": str(e)}
 
     async def _run_amazon(
@@ -177,7 +192,7 @@ class ScoutScraper:
     ) -> Dict[str, Any]:
         """Execute Amazon scrape with error isolation and pipeline filtering."""
         try:
-            logger.info(f"[SCOUT] Running Amazon scraper for: '{product_name}'")
+            logger.info("[SCOUT] Running Amazon scraper")
             res = await self._amazon.scrape_amazon_with_retry(
                 product_name=product_name,
                 category=category,
@@ -189,6 +204,9 @@ class ScoutScraper:
 
             status = _failure_status(res.get("status", "EMPTY"), res.get("error"))
             if status in ("BLOCKED", "TIMEOUT", "PARSE_ERROR"):
+                self._amazon.log_diagnostic("Amazon", "normalization", final_status=status,
+                                            reason_category=self._amazon.result_reason_category(status),
+                                            normalized_product_count=0)
                 return {
                     "platform": "Amazon",
                     "status": status,
@@ -206,6 +224,9 @@ class ScoutScraper:
             )
 
             final_status = "SUCCESS" if valid_prods else "EMPTY"
+            self._amazon.log_diagnostic("Amazon", "normalization", final_status=final_status,
+                                        reason_category=self._amazon.result_reason_category(final_status),
+                                        normalized_product_count=len(valid_prods))
             return {
                 "platform": "Amazon",
                 "status": final_status,
@@ -213,7 +234,10 @@ class ScoutScraper:
                 "error": None if valid_prods else "No relevant products found",
             }
         except Exception as e:
-            logger.error(f"[SCOUT] Amazon runner error: {e}", exc_info=True)
+            self._amazon.log_diagnostic("Amazon", "normalization", final_status="PARSE_ERROR",
+                                        reason_category="scraper_failure", exception=e,
+                                        normalized_product_count=0)
+            logger.error("[SCOUT] Amazon runner error: exception_class=%s", type(e).__name__)
             return {"platform": "Amazon", "status": "PARSE_ERROR", "products": [], "error": str(e)}
 
     async def scrape_sequential(
@@ -222,32 +246,56 @@ class ScoutScraper:
         category: Optional[str] = None,
         product_details: Optional[str] = None,
         max_products: Optional[int] = None,
+        platforms: Optional[List[str]] = None,
     ) -> Dict[str, Dict[str, Any]]:
         """
-        Sequential execution: Flipkart -> Amazon. Not concurrent.
-        Returns per-platform results: { "Flipkart": {...}, "Amazon": {...} }
+        Sequential execution with independent failure handling.
+        Returns per-platform outcomes without suppressing later marketplaces.
         """
         limit = min(max_products or HARD_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
 
         # Execute independently and sequentially so one site's challenge or
         # network failure cannot prevent collection from the remaining sites.
         async def safely_run(platform, runner):
+            scraper = {"Amazon": self._amazon, "Myntra": self._myntra,
+                       "Meesho": self._meesho, "Flipkart": self._flipkart}[platform]
             try:
-                return await runner(product_name, category, product_details, limit)
+                platform_timeout = AMAZON_PLATFORM_TIMEOUT_SECONDS if platform == "Amazon" else PLATFORM_TIMEOUT_SECONDS
+                return await asyncio.wait_for(
+                    runner(product_name, category, product_details, limit),
+                    timeout=platform_timeout,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("[SCOUT] %s exceeded its bounded marketplace timeout", platform)
+                scraper.log_diagnostic(platform, "final", final_status="TIMEOUT",
+                                       reason_category="timeout", exception=asyncio.TimeoutError(),
+                                       normalized_product_count=0)
+                return {"platform": platform, "status": "TIMEOUT", "products": [], "error": "Marketplace request timed out"}
             except Exception as exc:
-                return {"platform": platform, "status": _failure_status("FAILED", exc), "products": [], "error": str(exc)}
+                status = _failure_status("FAILED", exc)
+                scraper.log_diagnostic(platform, "final", final_status=status,
+                                       reason_category=scraper.result_reason_category(status), exception=exc,
+                                       normalized_product_count=0)
+                return {"platform": platform, "status": status, "products": [], "error": str(exc)}
 
-        flipkart_res = await safely_run("Flipkart", self._run_flipkart)
-        amazon_res = await safely_run("Amazon", self._run_amazon)
-        myntra_res = await safely_run("Myntra", self._run_myntra)
-        meesho_res = await safely_run("Meesho", self._run_meesho)
-
-        return {
-            "Flipkart": flipkart_res,
-            "Amazon": amazon_res,
-            "Myntra": myntra_res,
-            "Meesho": meesho_res,
+        runners = {
+            "Myntra": self._run_myntra,
+            "Meesho": self._run_meesho,
+            "Amazon": self._run_amazon,
+            "Flipkart": self._run_flipkart,
         }
+        selected = list(runners) if platforms is None else [
+            name for name in runners if any(str(requested).casefold() == name.casefold() for requested in platforms)
+        ]
+        results = {}
+        for platform in selected:
+            results[platform] = await safely_run(platform, runners[platform])
+            # Honor the user's requested fallback order and stop once a
+            # marketplace supplies normalized products. If callers explicitly
+            # select multiple platforms for comparison, collect each selection.
+            if platforms is None and results[platform].get("products"):
+                break
+        return results
 
     async def _run_additional_platform(self, scraper, platform, method_name, product_name, category, product_details, limit):
         try:
@@ -259,9 +307,15 @@ class ScoutScraper:
             if status == "SUCCESS":
                 products, _ = process_platform_pipeline(platform, product_name, category, products, limit)
                 status = "SUCCESS" if products else "EMPTY"
+            scraper.log_diagnostic(platform, "normalization", final_status=status,
+                                   reason_category=scraper.result_reason_category(status),
+                                   normalized_product_count=len(products))
             return {"platform": platform, "status": status, "products": products[:limit], "error": result.get("error")}
         except Exception as exc:
-            logger.warning("[SCOUT] %s failed: %s", platform, exc)
+            scraper.log_diagnostic(platform, "normalization", final_status="PARSE_ERROR",
+                                   reason_category="scraper_failure", exception=exc,
+                                   normalized_product_count=0)
+            logger.warning("[SCOUT] %s failed: exception_class=%s", platform, type(exc).__name__)
             return {"platform": platform, "status": _failure_status("FAILED", exc), "products": [], "error": str(exc)}
 
     async def _run_myntra(self, product_name, category=None, product_details=None, max_products=10):
@@ -282,7 +336,7 @@ class ScoutScraper:
         Backward-compatible entry point returning all products + block sentinels.
         """
         limit = min(max_products or HARD_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
-        seq_res = await self.scrape_sequential(product_name, category, product_details, limit)
+        seq_res = await self.scrape_sequential(product_name, category, product_details, limit, platforms)
 
         out_products: List[Dict[str, Any]] = []
         for plat_name, res in seq_res.items():
@@ -307,7 +361,7 @@ class ScoutScraper:
     ) -> Dict[str, Any]:
         """Extended entry point returning per-platform status and products."""
         limit = min(max_products or HARD_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
-        seq_res = await self.scrape_sequential(product_name, category, product_details, limit)
+        seq_res = await self.scrape_sequential(product_name, category, product_details, limit, platforms)
 
         all_products = []
         platform_statuses = {}

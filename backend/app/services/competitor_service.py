@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 from app.models.competitor_product import CompetitorProduct
 from app.models.competitor_price_history import CompetitorPriceHistory
+from app.config import SCRAPE_FRESHNESS_THRESHOLD_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -89,7 +90,12 @@ def upsert_competitor_product(
     product_url: Optional[str] = None,
     product_details: Optional[str] = None,
     rating: Optional[float] = None,
-    availability: bool = True
+    availability: Optional[bool] = None,
+    quantity_value: Optional[float] = None,
+    quantity_unit: Optional[str] = None,
+    pack_count: Optional[int] = None,
+    total_quantity: Optional[float] = None,
+    total_quantity_unit: Optional[str] = None,
 ) -> CompetitorProduct:
     """
     Upsert competitor product according to stable identity:
@@ -175,6 +181,11 @@ def upsert_competitor_product(
         if product_details:
             db_comp.product_details = product_details
         db_comp.price = price
+        db_comp.quantity_value = quantity_value or db_comp.quantity_value
+        db_comp.quantity_unit = quantity_unit or db_comp.quantity_unit
+        db_comp.pack_count = pack_count or db_comp.pack_count
+        db_comp.total_quantity = total_quantity or db_comp.total_quantity
+        db_comp.total_quantity_unit = total_quantity_unit or db_comp.total_quantity_unit
         db_comp.rating = rating
         db_comp.availability = availability
         db_comp.scraped_at = now
@@ -192,6 +203,9 @@ def upsert_competitor_product(
             product_url=clean_url,
             product_details=product_details,
             price=price,
+            quantity_value=quantity_value, quantity_unit=quantity_unit,
+            pack_count=pack_count, total_quantity=total_quantity,
+            total_quantity_unit=total_quantity_unit,
             rating=rating,
             availability=availability,
             scraped_at=now,
@@ -261,12 +275,12 @@ def is_competitor_data_fresh(scraped_at: Optional[datetime], threshold_days: int
     return age <= timedelta(days=threshold_days)
 
 
-def has_fresh_competitor_data(db: Session, catalog_product_id: int, threshold_days: int = 7) -> bool:
+def get_competitor_freshness(db: Session, catalog_product_id: int) -> dict:
     """
     Single source of truth for scraping freshness decisions based on persisted DB timestamps.
 
     Queries competitor_products.scraped_at (most recent row for catalog_product_id).
-    Returns True if age <= threshold_days, False if expired or no competitor data exists.
+    Product catalog timestamps and workflow execution time are not freshness inputs.
     """
     latest = (
         db.query(CompetitorProduct)
@@ -276,11 +290,7 @@ def has_fresh_competitor_data(db: Session, catalog_product_id: int, threshold_da
     )
 
     if not latest:
-        logger.info(
-            f"[FRESHNESS] No competitor data found for catalog_product_id={catalog_product_id} "
-            f"→ scraping required."
-        )
-        return False
+        return {"status": "NO_EVIDENCE", "latest_observation_at": None, "age_days": None}
 
     scraped_at = latest.scraped_at
     if scraped_at.tzinfo is None:
@@ -290,15 +300,17 @@ def has_fresh_competitor_data(db: Session, catalog_product_id: int, threshold_da
     age = now - scraped_at
     age_days = age.total_seconds() / 86400.0
 
-    logger.info(
-        f"[FRESHNESS] Existing competitor age: {age_days:.1f} days "
-        f"(catalog_product_id={catalog_product_id}, threshold={threshold_days} days)"
-    )
+    status = "FRESH" if age <= timedelta(days=SCRAPE_FRESHNESS_THRESHOLD_DAYS, seconds=5) else "STALE"
+    logger.info("[FRESHNESS] catalog_product_id=%s status=%s age_days=%.2f threshold_days=%s",
+                catalog_product_id, status, age_days, SCRAPE_FRESHNESS_THRESHOLD_DAYS)
+    return {"status": status, "latest_observation_at": scraped_at, "age_days": age_days}
 
-    # 5-second buffer for DB execution/query latency
-    if age <= timedelta(days=threshold_days, seconds=5):
-        logger.info(f"[FRESHNESS] Fresh - scraping skipped: catalog_product_id={catalog_product_id}")
-        return True
-    else:
-        logger.info(f"[FRESHNESS] Expired - scraping required: catalog_product_id={catalog_product_id}")
-        return False
+
+def has_fresh_competitor_data(db: Session, catalog_product_id: int, threshold_days: Optional[int] = None) -> bool:
+    """Backward-compatible boolean API; configured freshness is used by production callers."""
+    if threshold_days is None or threshold_days == SCRAPE_FRESHNESS_THRESHOLD_DAYS:
+        return get_competitor_freshness(db, catalog_product_id)["status"] == "FRESH"
+    latest = db.query(CompetitorProduct).filter(
+        CompetitorProduct.catalog_product_id == catalog_product_id
+    ).order_by(CompetitorProduct.scraped_at.desc()).first()
+    return bool(latest and is_competitor_data_fresh(latest.scraped_at, threshold_days))

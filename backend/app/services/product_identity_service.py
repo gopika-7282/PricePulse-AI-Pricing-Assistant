@@ -5,9 +5,8 @@ Product Identity Resolution Service powered by PostgreSQL + Qwen3 (Ollama).
 
 Flow:
 1. Input product -> Retrieve candidates from PostgreSQL (<= 5)
-   - Deterministic SQL based on token/ILIKE overlap on product_name + details
-   - Category used as supporting context only
-   - Brand NEVER filtered
+   - PostgreSQL candidate retrieval ranks name/details first, with category and brand
+     as low-weight supporting signals
 2. Candidates -> Qwen3 (via llm_service.generate_structured)
    - Qwen3 receives ONLY input and candidate data (never touches DB directly)
    - Identity rules: name + description primary, brand ignored,
@@ -17,11 +16,11 @@ Flow:
    - Allowed decisions: MATCH_EXISTING, UNCERTAIN_MATCH, NEW_PRODUCT
    - matched_catalog_id MUST be one of candidate IDs
    - confidence in [0.0, 1.0]
-   - Fallback to safe UNCERTAIN_MATCH on any invalid data or LLM error
+   - Model/service failures raise IdentityServiceUnavailable, never an identity decision
 4. Catalog Lifecycle Resolution
    - MATCH_EXISTING -> reuse row (fresh -> reuse, stale -> re-scrape)
-   - UNCERTAIN_MATCH -> create independent row marked uncertain (never silently merge)
-   - NEW_PRODUCT -> create new ProductCatalog row
+   - MATCH -> reuse the selected catalog row
+   - NOT_MATCH / UNCERTAIN_MATCH -> LangGraph creates a new catalog row
 """
 
 from enum import Enum
@@ -35,8 +34,7 @@ from sqlalchemy import or_
 
 from app.models.product_catalog import ProductCatalog
 from app.services.llm_service import generate_structured
-from app.services.competitor_service import has_fresh_competitor_data
-from app.config import SCRAPE_FRESHNESS_THRESHOLD_DAYS
+from app.config import OLLAMA_IDENTITY_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +61,10 @@ class IdentityOutput(BaseModel):
     identity_factors: List[str] = Field(default_factory=list)
 
 
+class IdentityServiceUnavailable(RuntimeError):
+    """The identity model failed to run or returned an unusable response."""
+
+
 def extract_search_tokens(text: str) -> List[str]:
     """Extract alphanumeric tokens (len >= 3) excluding generic stop words."""
     if not text:
@@ -76,22 +78,27 @@ def retrieve_postgres_candidates(
     product_name: str,
     product_details: str = "",
     category: str = "",
+    brand: str = "",
     limit: int = 5,
+    exclude_catalog_ids: Optional[Set[int]] = None,
 ) -> List[ProductCatalog]:
     """
     Deterministic candidate retrieval from PostgreSQL (<= 5).
-    Evaluates token overlap on product_name and details.
-    Category is supporting context. Brand is NEVER filtered.
+    Ranks token overlap on name and details first; category and brand only add
+    small retrieval boosts and never determine the identity decision.
     """
     name_tokens = extract_search_tokens(product_name)
     details_tokens = extract_search_tokens(product_details)
-    all_tokens = list(dict.fromkeys(name_tokens + details_tokens))
+    brand_tokens = extract_search_tokens(brand)
+    all_tokens = list(dict.fromkeys(name_tokens + details_tokens + brand_tokens))
 
     logger.info(
         f"[CANDIDATE_SEARCH_STARTED] name='{product_name}' tokens={name_tokens[:5]}"
     )
 
     query = db.query(ProductCatalog)
+    if exclude_catalog_ids:
+        query = query.filter(~ProductCatalog.id.in_(exclude_catalog_ids))
 
     if not all_tokens:
         # Fallback to recent products if no tokens found
@@ -103,6 +110,7 @@ def retrieve_postgres_candidates(
     for tok in all_tokens[:8]:
         ilike_clauses.append(ProductCatalog.name.ilike(f"%{tok}%"))
         ilike_clauses.append(ProductCatalog.product_details.ilike(f"%{tok}%"))
+        ilike_clauses.append(ProductCatalog.brand.ilike(f"%{tok}%"))
 
     if category:
         cat_tokens = extract_search_tokens(category)
@@ -119,31 +127,25 @@ def retrieve_postgres_candidates(
         matching_rows = list(row_map.values())
 
     # Deterministic scoring:
-    clean_target = product_name.lower().strip()
-
     def score_candidate(cand: ProductCatalog) -> float:
-        cand_name = (cand.name or "").lower().strip()
-        cand_details = (cand.product_details or "").lower().strip()
-        score = 0.0
-
-        if cand_name == clean_target:
-            score += 100.0
-
-        for tok in name_tokens:
-            if tok in cand_name:
-                score += 15.0
-            if tok in cand_details:
-                score += 5.0
-
-        for tok in details_tokens:
-            if tok in cand_name:
-                score += 5.0
-            if tok in cand_details:
-                score += 2.0
-
-        if category and cand.category and category.lower() == cand.category.lower():
-            score += 3.0
-
+        candidate_name_tokens = set(extract_search_tokens(cand.name or ""))
+        candidate_detail_tokens = set(extract_search_tokens(cand.product_details or ""))
+        target_name_tokens = set(name_tokens)
+        name_overlap = target_name_tokens & candidate_name_tokens
+        coverage = len(name_overlap) / max(1, len(target_name_tokens))
+        union = target_name_tokens | candidate_name_tokens
+        name_similarity = len(name_overlap) / max(1, len(union))
+        detail_overlap = target_name_tokens & candidate_detail_tokens
+        incoming_detail_overlap = set(details_tokens) & (candidate_name_tokens | candidate_detail_tokens)
+        score = (coverage * 45.0) + (name_similarity * 30.0)
+        score += (len(detail_overlap) / max(1, len(target_name_tokens))) * 15.0
+        score += (len(incoming_detail_overlap) / max(1, len(details_tokens))) * 8.0
+        if category and cand.category and category.casefold().strip() == cand.category.casefold().strip():
+            score += 5.0
+        # Brand can help retrieve a candidate, but its small weight cannot
+        # outrank product identity, product type, or identifying details.
+        candidate_brand_tokens = set(extract_search_tokens(cand.brand or ""))
+        score += (len(set(brand_tokens) & candidate_brand_tokens) / max(1, len(set(brand_tokens)))) * 2.0
         return score
 
     ranked = sorted(matching_rows, key=score_candidate, reverse=True)
@@ -161,6 +163,10 @@ def build_identity_prompt(
     product_details: str,
     category: str,
     candidates: List[Dict[str, Any]],
+    brand: str = "",
+    cost_price: Optional[float] = None,
+    stock_quantity: Optional[int] = None,
+    minimum_profit_margin: Optional[float] = None,
 ) -> str:
     """Build structured LLM prompt enforcing identity resolution rules."""
     candidates_repr = [
@@ -169,14 +175,19 @@ def build_identity_prompt(
             "product_name": c["name"],
             "category": c.get("category") or "",
             "description": c.get("product_details") or "",
+            "brand": c.get("brand") or "",
         }
         for c in candidates
     ]
 
     return f"""INCOMING PRODUCT:
 - Name: "{product_name}"
+- Brand: "{brand}"
 - Category: "{category}"
 - Details: "{product_details}"
+- Cost price: {cost_price}
+- Stock quantity: {stock_quantity}
+- Minimum profit margin: {minimum_profit_margin}
 
 EXISTING CATALOG CANDIDATES (Choose at most one matching catalog_id):
 {json.dumps(candidates_repr, indent=2)}
@@ -185,8 +196,8 @@ TASK:
 Determine if the INCOMING PRODUCT is the EXACT SAME generic product as one of the candidates, an UNCERTAIN_MATCH, or NOT_MATCH.
 
 CORE RULES:
-1. Primary signals: product name and description. Supporting signals: product type, intended use, key active ingredient/material.
-2. IGNORE BRAND COMPLETELY: Brand is metadata, not generic identity. Different brands of the same product type and active ingredient can represent the SAME generic catalog product.
+1. Primary signals: product identity in the name; verify product type, intended use, ingredients/material, and details. Cost, stock, and margin are context only and MUST NOT affect identity.
+2. Brand is supporting metadata only. Different brands do not make otherwise identical generic products different.
 3. Same category != same product: differing product types or key ingredients mean NOT_MATCH.
 4. Regional, multilingual, typo, and transliteration matches must be inferred from the complete product evidence, not a hardcoded alias list.
 5. Generic reasoning only: No hardcoded brand or category bias.
@@ -207,6 +218,10 @@ def evaluate_product_identity(
     product_details: str = "",
     category: str = "",
     brand: str = "",
+    exclude_catalog_ids: Optional[Set[int]] = None,
+    cost_price: Optional[float] = None,
+    stock_quantity: Optional[int] = None,
+    minimum_profit_margin: Optional[float] = None,
 ) -> IdentityOutput:
     """
     Main product identity pipeline:
@@ -217,7 +232,9 @@ def evaluate_product_identity(
         product_name=product_name,
         product_details=product_details,
         category=category,
+        brand=brand,
         limit=5,
+        exclude_catalog_ids=exclude_catalog_ids,
     )
 
     if not candidates:
@@ -230,24 +247,6 @@ def evaluate_product_identity(
             identity_factors=["empty_catalog"],
         )
 
-    # An exact normalized name is a safe, deterministic shortcut for the
-    # unambiguous case. Ambiguous names still go to Qwen; no product aliases
-    # or language-specific mappings are embedded here.
-    incoming_tokens = set(extract_search_tokens(product_name))
-    exact_name_candidates = [
-        candidate for candidate in candidates
-        if incoming_tokens and set(extract_search_tokens(candidate.name or "")) == incoming_tokens
-    ]
-    if exact_name_candidates:
-        best = exact_name_candidates[0]
-        return IdentityOutput(
-            decision=IdentityDecision.MATCH,
-            matched_catalog_id=best.id,
-            confidence=0.99,
-            reason="The normalized product name matches an existing catalog item.",
-            identity_factors=["normalized_name_match"],
-        )
-
     candidate_ids = {c.id for c in candidates}
     cand_dicts = [
         {
@@ -255,6 +254,7 @@ def evaluate_product_identity(
             "name": c.name,
             "category": c.category or "",
             "product_details": c.product_details or "",
+            "brand": c.brand or "",
         }
         for c in candidates
     ]
@@ -263,29 +263,19 @@ def evaluate_product_identity(
         product_name=product_name,
         product_details=product_details,
         category=category,
+        brand=brand,
         candidates=cand_dicts,
+        cost_price=cost_price,
+        stock_quantity=stock_quantity,
+        minimum_profit_margin=minimum_profit_margin,
     )
 
-    llm_resp = generate_structured(
-        prompt=prompt,
-        model="qwen3:8b",
-        timeout=30.0,
-    )
+    llm_resp = generate_structured(prompt=prompt, timeout=OLLAMA_IDENTITY_TIMEOUT, operation="product_identity")
 
     if not llm_resp.get("success") or not llm_resp.get("data"):
-        err = llm_resp.get("error") or "LLM generation failed"
-        logger.warning(
-            f"[IDENTITY_LLM_DOWN_FALLBACK] LLM error for '{product_name}': {err}. "
-            "Falling back safely to UNCERTAIN_MATCH."
-        )
-        # LLM down -> UNCERTAIN, pipeline does not fail
-        return IdentityOutput(
-            decision=IdentityDecision.UNCERTAIN_MATCH,
-            matched_catalog_id=None,
-            confidence=0.0,
-            reason=f"LLM evaluation unavailable: {err}",
-            identity_factors=["llm_error_fallback"],
-        )
+        err = llm_resp.get("error") or "Qwen identity generation failed"
+        logger.error("[IDENTITY_SERVICE_UNAVAILABLE] operation=product_identity error=%s", err)
+        raise IdentityServiceUnavailable(err)
 
     data = llm_resp["data"]
 
@@ -293,8 +283,8 @@ def evaluate_product_identity(
     try:
         raw_decision = str(data.get("decision", "")).strip().upper()
         raw_decision = {"MATCH_EXISTING": "MATCH", "NEW_PRODUCT": "NOT_MATCH"}.get(raw_decision, raw_decision)
-        if raw_decision not in [d.value for d in IdentityDecision]:
-            raw_decision = IdentityDecision.UNCERTAIN_MATCH.value
+        if raw_decision not in {"MATCH", "UNCERTAIN_MATCH", "NOT_MATCH"}:
+            raise IdentityServiceUnavailable("Qwen returned an invalid identity decision")
 
         raw_id = data.get("matched_catalog_id")
         raw_conf = data.get("confidence", 0.0)
@@ -304,8 +294,7 @@ def evaluate_product_identity(
             conf = float(raw_conf)
             conf = max(0.0, min(1.0, conf))
         except (ValueError, TypeError):
-            conf = 0.5
-            raw_decision = IdentityDecision.UNCERTAIN_MATCH.value
+            raise IdentityServiceUnavailable("Qwen returned an invalid identity confidence")
 
         validated_id = None
         if raw_decision == IdentityDecision.MATCH.value:
@@ -315,15 +304,11 @@ def evaluate_product_identity(
                     if int_id in candidate_ids:
                         validated_id = int_id
                     else:
-                        logger.warning(
-                            f"[IDENTITY_VALIDATION_FAILED] LLM matched ID {int_id} "
-                            f"not in candidate IDs {candidate_ids}. Forcing UNCERTAIN_MATCH."
-                        )
-                        raw_decision = IdentityDecision.UNCERTAIN_MATCH.value
+                        raise IdentityServiceUnavailable("Qwen selected a catalog candidate that was not supplied")
                 except (ValueError, TypeError):
-                    raw_decision = IdentityDecision.UNCERTAIN_MATCH.value
+                    raise IdentityServiceUnavailable("Qwen returned an invalid catalog candidate ID")
             else:
-                raw_decision = IdentityDecision.UNCERTAIN_MATCH.value
+                raise IdentityServiceUnavailable("Qwen returned MATCH without a catalog candidate ID")
 
         output = IdentityOutput(
             decision=IdentityDecision(raw_decision),
@@ -338,15 +323,11 @@ def evaluate_product_identity(
         )
         return output
 
+    except IdentityServiceUnavailable:
+        raise
     except Exception as val_exc:
-        logger.error(f"[IDENTITY_VALIDATION_ERROR] {val_exc}", exc_info=True)
-        return IdentityOutput(
-            decision=IdentityDecision.UNCERTAIN_MATCH,
-            matched_catalog_id=None,
-            confidence=0.0,
-            reason=f"Validation error: {val_exc}",
-            identity_factors=["validation_exception"],
-        )
+        logger.error("[IDENTITY_VALIDATION_ERROR] %s", val_exc, exc_info=True)
+        raise IdentityServiceUnavailable("Qwen identity response could not be validated") from val_exc
 
 
 def determine_product_lifecycle(
@@ -356,13 +337,7 @@ def determine_product_lifecycle(
     brand: str = "",
     product_details: str = "",
 ) -> Dict[str, Any]:
-    """
-    Catalog lifecycle resolution:
-    - MATCH_EXISTING -> reuse the row. Fresh -> reuse data. Stale -> same row, re-scrape.
-      Never create a duplicate for staleness.
-    - UNCERTAIN_MATCH -> never silently merge. Create new row marked uncertain / return for review.
-    - NEW_PRODUCT -> create a ProductCatalog row.
-    """
+    """Compatibility adapter for identity only; freshness belongs to LangGraph."""
     identity = evaluate_product_identity(
         db=db,
         product_name=product_name,
@@ -371,58 +346,10 @@ def determine_product_lifecycle(
         brand=brand,
     )
 
-    if identity.decision == IdentityDecision.MATCH_EXISTING and identity.matched_catalog_id:
-        catalog_product_id = identity.matched_catalog_id
-        is_fresh = has_fresh_competitor_data(
-            db=db,
-            catalog_product_id=catalog_product_id,
-            threshold_days=SCRAPE_FRESHNESS_THRESHOLD_DAYS,
-        )
-        if is_fresh:
-            logger.info(
-                f"[FRESH_DATA_REUSED] Competitor data fresh (id={catalog_product_id}). "
-                "Reusing existing catalog product without scraping."
-            )
-            decision = "REUSE_EXISTING"
-        else:
-            logger.info(
-                f"[DATA_EXPIRED_REFRESH_STARTED] Competitor data stale (id={catalog_product_id}). "
-                "Reusing catalog row and initiating re-scrape."
-            )
-            decision = "REFRESH_EXISTING"
-
-        return {
-            "decision": decision,
-            "catalog_product_id": catalog_product_id,
-            "match_confidence": identity.confidence,
-            "identity_decision": identity.decision.value,
-            "reason": identity.reason,
-            "uncertain": False,
-        }
-
-    elif identity.decision == IdentityDecision.UNCERTAIN_MATCH:
-        logger.warning(
-            f"[UNCERTAIN_MATCH_DETECTED] Possible match for '{product_name}' "
-            f"(candidate={identity.matched_catalog_id}, conf={identity.confidence:.2f}). "
-            "Never silently merging; creating isolated new catalog entry."
-        )
-        return {
-            "decision": "CREATE_NEW",
-            "catalog_product_id": None,
-            "match_confidence": identity.confidence,
-            "identity_decision": identity.decision.value,
-            "reason": identity.reason,
-            "uncertain": True,
-            "suggested_match_id": identity.matched_catalog_id,
-        }
-
-    else:
-        logger.info(f"[NEW_PRODUCT_CREATED] '{product_name}' resolved as NEW_PRODUCT.")
-        return {
-            "decision": "CREATE_NEW",
-            "catalog_product_id": None,
-            "match_confidence": identity.confidence,
-            "identity_decision": identity.decision.value,
-            "reason": identity.reason,
-            "uncertain": False,
-        }
+    if identity.decision == IdentityDecision.MATCH and identity.matched_catalog_id:
+        return {"decision": "MATCH", "catalog_product_id": identity.matched_catalog_id,
+                "identity_decision": identity.decision.value, "match_confidence": identity.confidence,
+                "reason": identity.reason}
+    return {"decision": "CREATE_NEW", "catalog_product_id": None,
+            "identity_decision": identity.decision.value, "match_confidence": identity.confidence,
+            "reason": identity.reason}

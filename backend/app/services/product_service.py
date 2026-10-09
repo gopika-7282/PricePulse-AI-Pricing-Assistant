@@ -1,11 +1,6 @@
 from sqlalchemy.orm import Session
 from app.models.product_catalog import ProductCatalog
 from app.models.retailer_product import RetailerProduct
-from app.services.competitor_service import has_fresh_competitor_data
-from app.services.scraping_service import scrape_product
-from app.services.pricing_service import calculate_price_analysis, generate_recommendation
-from app.services.matching_service import find_catalog_match, find_existing_product
-from app.config import SCRAPE_FRESHNESS_THRESHOLD_DAYS
 from typing import List, Optional
 import logging
 
@@ -34,22 +29,19 @@ def create_product_catalog(
     return db_catalog
 
 
+def find_existing_product(db: Session, name: str, category: str = "", brand: str = "") -> Optional[ProductCatalog]:
+    """Compatibility lookup that delegates identity semantics to the canonical Qwen service.
 
-def find_existing_product(
-    db: Session,
-    name: str,
-    category: str = "",
-    brand: str = "",
-    product_details: str = "",
-) -> Optional[ProductCatalog]:
-    """Find existing catalog product using matching service."""
-    return find_catalog_match(
-        db=db,
-        name=name,
-        category=category,
-        brand=brand,
-        details=product_details,
-    )
+    The retailer pricing workflow does not call this helper; its LangGraph identity
+    and catalog-decision nodes remain authoritative for create/edit lifecycle.
+    """
+    from app.services.product_identity_service import evaluate_product_identity
+
+    result = evaluate_product_identity(db, name, "", category, brand)
+    if result.decision.value != "MATCH" or not result.matched_catalog_id:
+        return None
+    return db.query(ProductCatalog).filter(ProductCatalog.id == result.matched_catalog_id).first()
+
 
 
 def create_retailer_product(
@@ -61,47 +53,34 @@ def create_retailer_product(
     product_details: str,
     cost_price: float,
     stock_quantity: int,
-    minimum_profit_margin: float
+    minimum_profit_margin: float,
+    quantity_value: float | None = None,
+    quantity_unit: str | None = None,
 ) -> RetailerProduct:
     logger.info(f"[PRODUCT] Incoming product: name='{name}' category='{category}' brand='{brand}'")
 
-    # Intelligent Lifecycle Decision
-    from app.services.catalog_lifecycle_service import determine_product_lifecycle
-    
-    lifecycle_result = determine_product_lifecycle(
-        db=db,
-        product_name=name,
-        category=category,
-        brand=brand,
-        product_details=product_details
+    # The non-null catalog FK needs a staging relationship. LangGraph's
+    # identity/catalog nodes make the final decision and replace it as needed.
+    catalog_product = ProductCatalog(
+        name=name, category=category, brand=brand, product_details=product_details,
     )
-    
-    decision = lifecycle_result["decision"]
-    catalog_product_id = lifecycle_result["catalog_product_id"]
-    
-    if decision == "CREATE_NEW":
-        catalog_product = create_product_catalog(db, name, category, brand, product_details)
-        needs_scraping = True
-    elif decision == "REFRESH_EXISTING":
-        catalog_product = get_catalog_product_by_id(db, catalog_product_id)
-        needs_scraping = True
-    elif decision == "REUSE_EXISTING":
-        catalog_product = get_catalog_product_by_id(db, catalog_product_id)
-        needs_scraping = False
-    else:
-        raise ValueError(f"Unknown lifecycle decision: {decision}")
-
-    if needs_scraping:
-        scrape_product(db, catalog_product)
-        if decision == "REFRESH_EXISTING":
-            logger.info(f"[COMPETITOR_REFRESH_COMPLETED] id={catalog_product.id}")
+    db.add(catalog_product)
+    db.flush()
 
     # Step 4: Create retailer_product linked to this user and catalog entry
     db_retailer_product = RetailerProduct(
         user_id=user_id,
         catalog_product_id=catalog_product.id,
+        name_override=name,
+        category_override=category,
+        brand_override=brand,
+        product_details_override=product_details,
+        catalog_identity_pending=True,
+        catalog_identity_staging=True,
         cost_price=cost_price,
         stock_quantity=stock_quantity,
+        quantity_value=quantity_value,
+        quantity_unit=quantity_unit,
         minimum_profit_margin=minimum_profit_margin
     )
     db.add(db_retailer_product)
@@ -128,21 +107,35 @@ def update_retailer_product(
     db: Session,
     product_id: int,
     user_id: int,
+    name: str,
+    category: str,
+    brand: str,
+    product_details: str,
     cost_price: float,
     stock_quantity: int,
-    minimum_profit_margin: float
+    minimum_profit_margin: float,
+    quantity_value: float | None = None,
+    quantity_unit: str | None = None,
 ) -> Optional[RetailerProduct]:
     product = get_retailer_product_by_id(db, product_id, user_id)
     if product:
+        product.catalog_identity_pending = True
+        product.catalog_identity_staging = False
+        product.name_override = name
+        product.category_override = category
+        product.brand_override = brand
+        product.product_details_override = product_details
         product.cost_price = cost_price
         product.stock_quantity = stock_quantity
+        product.quantity_value = quantity_value
+        product.quantity_unit = quantity_unit
         product.minimum_profit_margin = minimum_profit_margin
+        # Existing analysis belongs to the previous inputs and must not appear
+        # as current after a retailer changes product or pricing details.
+        product.recommendation.clear()
+        product.price_analysis.clear()
         db.commit()
         db.refresh(product)
-
-        # Regenerate recommendation because costs moved
-        calculate_price_analysis(db, product.id)
-        generate_recommendation(db, product.id)
 
     return product
 
@@ -150,7 +143,15 @@ def update_retailer_product(
 def delete_retailer_product(db: Session, product_id: int, user_id: int) -> bool:
     product = get_retailer_product_by_id(db, product_id, user_id)
     if product:
+        pending_catalog = product.catalog_product if product.catalog_identity_staging else None
         db.delete(product)
+        db.flush()
+        if pending_catalog is not None:
+            from app.models.competitor_product import CompetitorProduct
+            other_retailer = db.query(RetailerProduct.id).filter_by(catalog_product_id=pending_catalog.id).first()
+            observed = db.query(CompetitorProduct.id).filter_by(catalog_product_id=pending_catalog.id).first()
+            if not other_retailer and not observed:
+                db.delete(pending_catalog)
         db.commit()
         return True
     return False

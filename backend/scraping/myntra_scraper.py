@@ -88,7 +88,7 @@ def build_myntra_query(
             parts.append(detail_hint)
 
     query = " ".join(parts)
-    logger.info(f"[MYNTRA_SCRAPER] Dynamic search query built: '{query}'")
+    logger.info("[MYNTRA_SCRAPER] Dynamic search query built")
     return query
 
 
@@ -189,7 +189,9 @@ def _parse_myntra_search_page(html: str) -> List[Dict[str, Any]]:
                         "product_url": url if url.startswith("http") else f"https://www.myntra.com{url}",
                         "price": price or 0.0,
                         "rating": rating,
-                        "availability": True,
+                        "availability": (False if "outofstock" in str(offers.get("availability", "")).casefold()
+                                         else True if "instock" in str(offers.get("availability", "")).casefold()
+                                         else None),
                         "product_details": [],
                         "ranking": len(results) + 1,
                     })
@@ -282,18 +284,15 @@ def _parse_myntra_search_page(html: str) -> List[Dict[str, Any]]:
                 "product_url": href,
                 "price": price or 0.0,
                 "rating": rating,
-                "availability": True,
+                "availability": None,
                 "product_details": [],
                 "ranking": len(results) + 1,
             })
 
-            logger.info(
-                f"[MYNTRA_SCRAPER] Candidate rank={len(results)}: '{title[:40]}' "
-                f"price={price} rating={rating}"
-            )
+            logger.debug("[MYNTRA_SCRAPER] Candidate parsed rank=%d", len(results))
 
         except Exception as item_err:
-            logger.debug(f"[MYNTRA_SCRAPER] Item parse error: {item_err}")
+            logger.debug("[MYNTRA_SCRAPER] Item parse error: exception_class=%s", type(item_err).__name__)
             continue
 
     return results
@@ -312,7 +311,7 @@ def _parse_myntra_detail_page(html: str, url: str) -> Dict[str, Any]:
     price: Optional[float] = None
     rating: Optional[float] = None
     details_list: List[str] = []
-    availability = True
+    availability = None
 
     # LAYER 1: JSON-LD
     for script in soup.find_all("script", type="application/ld+json"):
@@ -334,8 +333,11 @@ def _parse_myntra_detail_page(html: str, url: str) -> Dict[str, Any]:
                     if isinstance(offers, dict):
                         if price is None and offers.get("price"):
                             price = _parse_numeric_price(offers["price"])
-                        if "OutOfStock" in str(offers.get("availability", "")):
+                        offer_state = str(offers.get("availability", "")).casefold()
+                        if "outofstock" in offer_state:
                             availability = False
+                        elif "instock" in offer_state:
+                            availability = True
                     agg = item.get("aggregateRating", {})
                     if isinstance(agg, dict) and rating is None:
                         rating = _parse_numeric_rating(agg.get("ratingValue"))
@@ -434,12 +436,17 @@ class MyntraScraper(BaseScraper):
         encoded_query = urllib.parse.quote(query)
         search_url = f"https://www.myntra.com/{encoded_query}"
 
-        logger.info(f"[MYNTRA_SCRAPING_STARTED] Navigating to search URL: {search_url}")
+        logger.info("[MYNTRA_SCRAPING_STARTED] platform=Myntra stage=search")
         self.search_result_status = "PARSE_ERROR"
-        nav_ok = await self.safe_navigate(page, search_url, wait_until="domcontentloaded")
+        nav_ok = await self.safe_navigate(page, search_url, wait_until="domcontentloaded", platform="Myntra", stage="search")
 
         if not nav_ok:
             self.search_result_status = self.last_navigation_status or "NETWORK_ERROR"
+            self.log_diagnostic("Myntra", "search", requested_url=search_url,
+                                final_url=getattr(page, "url", None), navigation="failure",
+                                challenge=None, challenge_reason="not_checked_navigation_failure",
+                                product_card_count=0, normalized_product_count=0,
+                                reason_category=self.result_reason_category(self.search_result_status))
             logger.error("[MYNTRA_SCRAPING_FAILED] reason=page_navigation_error")
             return [], False
 
@@ -451,20 +458,30 @@ class MyntraScraper(BaseScraper):
 
         if not html or len(html) < 500:
             self.search_result_status = self.last_navigation_status or "PARSE_ERROR"
+            self.log_diagnostic("Myntra", "search", requested_url=search_url, final_url=current_url,
+                                challenge=None, challenge_reason="not_checked_short_or_empty_page",
+                                product_card_count=0, normalized_product_count=0,
+                                reason_category="empty_page_content")
             logger.error("[MYNTRA_SCRAPING_FAILED] reason=empty_page_content")
             return [], False
 
-        if _is_myntra_blocked(html, current_url):
-            logger.warning(
-                f"[MYNTRA_SCRAPING_BLOCKED] Block/login-wall detected at URL: {current_url[:80]}"
-            )
+        challenge_detected = _is_myntra_blocked(html, current_url)
+        self.log_diagnostic("Myntra", "search", requested_url=search_url, final_url=current_url,
+                            challenge=challenge_detected,
+                            challenge_reason=self.challenge_reason_category(
+                                challenge_detected, html, current_url,
+                                url_markers=("/login",),
+                                html_markers=MYNTRA_BLOCK_SIGNALS + MYNTRA_LOGIN_WALL_SIGNALS,
+                            ))
+        if challenge_detected:
             return [], True
 
         logger.info("[MYNTRA_PAGE_RENDERED] Search page content captured successfully.")
         candidates = _parse_myntra_search_page(html)
         if not candidates:
             self.search_result_status = self.last_navigation_status or self.classify_empty_search(html)
-        logger.info(f"[MYNTRA_DATA_EXTRACTED] Search page candidates discovered: {len(candidates)}")
+        self.log_diagnostic("Myntra", "search_parse", requested_url=search_url, final_url=current_url,
+                            product_card_count=len(candidates))
         return candidates, False
 
     async def _fetch_detail_page(
@@ -479,24 +496,41 @@ class MyntraScraper(BaseScraper):
             logger.warning(f"[MYNTRA_SCRAPER] Skipping candidate {idx}/{total}: empty URL.")
             return {}
 
-        logger.info(f"[MYNTRA_SCRAPER] Detail page {idx}/{total}: {cand_url[:80]}")
+        logger.info("[MYNTRA_SCRAPER] platform=Myntra stage=detail candidate=%d/%d", idx, total)
 
         await page.wait_for_timeout(1500)
 
         try:
             await page.goto(cand_url, wait_until="commit", timeout=20000)
-            await page.wait_for_timeout(1500)
-            detail_html = await page.content()
         except Exception as e:
-            logger.warning(
-                f"[MYNTRA_SCRAPER] Detail page load failed for {cand_url[:60]}: {e}. "
-                "Using search card fallback."
-            )
+            self.log_diagnostic("Myntra", "detail", requested_url=cand_url,
+                                final_url=getattr(page, "url", None), navigation="failure",
+                                exception=e, reason_category="detail_navigation_failure")
+            logger.warning("[MYNTRA_SCRAPER] Detail page load failed; using search card fallback. exception_class=%s",
+                           type(e).__name__)
             detail_html = ""
+        else:
+            self.log_diagnostic("Myntra", "detail", requested_url=cand_url,
+                                final_url=getattr(page, "url", None), navigation="success")
+            try:
+                await page.wait_for_timeout(1500)
+                detail_html = await page.content()
+            except Exception as e:
+                self.log_diagnostic("Myntra", "detail_capture", requested_url=cand_url,
+                                    final_url=getattr(page, "url", None), navigation="success",
+                                    exception=e, reason_category="page_capture_failure")
+                detail_html = ""
 
-        if detail_html and _is_myntra_blocked(detail_html, page.url):
+        detail_challenge = _is_myntra_blocked(detail_html, page.url) if detail_html else False
+        self.log_diagnostic("Myntra", "detail", requested_url=cand_url,
+                            final_url=getattr(page, "url", None), challenge=detail_challenge,
+                            challenge_reason=self.challenge_reason_category(
+                                detail_challenge, detail_html, getattr(page, "url", ""),
+                                url_markers=("/login",),
+                                html_markers=MYNTRA_BLOCK_SIGNALS + MYNTRA_LOGIN_WALL_SIGNALS,
+                            ) if detail_html else "not_checked_no_html")
+        if detail_challenge:
             self.challenge_detected = True
-            logger.warning(f"[MYNTRA_SCRAPING_BLOCKED] Detail page blocked for {cand_url[:60]}")
             detail_html = ""
 
         detailed: Dict[str, Any] = {}
@@ -516,17 +550,17 @@ class MyntraScraper(BaseScraper):
                 if detailed.get("rating") is not None
                 else cand.get("rating")
             ),
-            "availability": detailed.get("availability", cand.get("availability", True)),
+            "availability": (detailed.get("availability") if detailed.get("availability") is not None
+                             else cand.get("availability")),
             "product_details": detailed.get("product_details") or cand.get("product_details", []),
             "scraped_at": scraped_at,
             "ranking": cand.get("ranking", idx),
         }
 
-        if merged["product_title"]:
-            logger.info(
-                f"[MYNTRA_DATA_EXTRACTED] Product {idx}: '{merged['product_title'][:40]}' "
-                f"price={merged['price']} rating={merged['rating']}"
-            )
+        self.log_diagnostic("Myntra", "detail_parse", requested_url=cand_url,
+                            final_url=getattr(page, "url", None),
+                            normalized_product_count=1 if merged["product_title"] else 0,
+                            reason_category="parsed" if merged["product_title"] else "missing_product_title")
 
         return merged
 
@@ -547,10 +581,7 @@ class MyntraScraper(BaseScraper):
         limit = min(max_products or DEFAULT_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
         query = build_myntra_query(product_name, category, product_details)
 
-        logger.info(
-            f"[MYNTRA_SCRAPING_STARTED] product='{product_name}' "
-            f"query='{query}' max_products={limit}"
-        )
+        logger.info("[MYNTRA_SCRAPING_STARTED] platform=Myntra stage=scrape max_products=%d", limit)
 
         products: List[Dict[str, Any]] = []
         self.challenge_detected = False
@@ -582,10 +613,8 @@ class MyntraScraper(BaseScraper):
                         }
 
                     selected = candidates[:limit]
-                    logger.info(
-                        f"[MYNTRA_SCRAPER] Processing {len(selected)} candidates "
-                        f"(of {len(candidates)} found)"
-                    )
+                    self.log_diagnostic("Myntra", "candidate_selection", product_card_count=len(candidates),
+                                        reason_category="selection_complete")
 
                     for idx, cand in enumerate(selected, 1):
                         product = await self._fetch_detail_page(page, cand, idx, len(selected))
@@ -599,10 +628,8 @@ class MyntraScraper(BaseScraper):
                     await self.close_session(browser, context)
 
         except Exception as e:
-            logger.error(
-                f"[MYNTRA_SCRAPING_FAILED] Unexpected error during scraping: {e}",
-                exc_info=True,
-            )
+            logger.error("[MYNTRA_SCRAPING_FAILED] platform=Myntra reason_category=scraper_failure exception_class=%s",
+                         type(e).__name__)
             return {
                 "platform": "Myntra",
                 "status": "FAILED",
@@ -610,10 +637,8 @@ class MyntraScraper(BaseScraper):
                 "error": str(e),
             }
 
-        logger.info(
-            f"[MYNTRA_SCRAPING_COMPLETED] product='{product_name}' "
-            f"results_collected={len(products)}"
-        )
+        self.log_diagnostic("Myntra", "scrape", normalized_product_count=len(products),
+                            final_status="OK", reason_category="success")
         return {"platform": "Myntra", "status": "OK", "products": products}
 
     async def scrape_myntra_with_retry(
@@ -637,7 +662,7 @@ class MyntraScraper(BaseScraper):
         }
 
         for attempt_num in range(1, self.max_retries + 1):
-            logger.info(f"[MYNTRA_SCRAPER] Scrape attempt {attempt_num}/{self.max_retries}")
+            logger.info("[MYNTRA_SCRAPER] platform=Myntra stage=attempt attempt=%d/%d", attempt_num, self.max_retries)
             try:
                 result = await self.scrape_myntra(
                     product_name, category, product_details, max_products
@@ -645,6 +670,9 @@ class MyntraScraper(BaseScraper):
                 status = self.classify_status(result.get("status"), result.get("error"))
                 result = {**result, "status": status}
                 last_result = result
+                self.log_diagnostic("Myntra", "attempt_result", final_status=status,
+                                    reason_category=self.result_reason_category(status),
+                                    normalized_product_count=len(result.get("products") or []))
 
                 if status == "BLOCKED":
                     logger.warning(
@@ -671,16 +699,17 @@ class MyntraScraper(BaseScraper):
                     "products": [],
                     "error": str(e),
                 }
+                self.log_diagnostic("Myntra", "attempt_result", final_status=status,
+                                    reason_category=self.result_reason_category(status), exception=e)
                 if status not in {"NETWORK_ERROR", "TIMEOUT"}:
                     return last_result
-                logger.warning(f"[MYNTRA_SCRAPER] Attempt {attempt_num} raised exception: {e}")
+                logger.warning("[MYNTRA_SCRAPER] Attempt raised exception. exception_class=%s", type(e).__name__)
 
             if attempt_num < self.max_retries:
                 wait_secs = 2 ** attempt_num
                 logger.info(f"[MYNTRA_SCRAPER] Retrying in {wait_secs}s...")
                 await asyncio.sleep(wait_secs)
 
-        logger.error(
-            f"[MYNTRA_SCRAPING_FAILED] All {self.max_retries} attempts failed for '{product_name}'."
-        )
+        logger.error("[MYNTRA_SCRAPING_FAILED] platform=Myntra reason_category=%s status=%s",
+                     self.result_reason_category(last_result.get("status")), last_result.get("status"))
         return last_result

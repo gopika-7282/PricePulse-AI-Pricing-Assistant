@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, Text, Boolean, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, Float, Text, Boolean, ForeignKey, DateTime, String
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -10,10 +10,13 @@ class Recommendation(Base):
     id = Column(Integer, primary_key=True, index=True)
     retailer_product_id = Column(Integer, ForeignKey("retailer_products.id", ondelete="CASCADE"), nullable=False, index=True)
     recommended_price = Column(Float, nullable=False)
+    recommended_price_min = Column(Float, nullable=True)
+    recommended_price_max = Column(Float, nullable=True)
     expected_profit = Column(Float, nullable=False)
     profit_percentage = Column(Float, nullable=False)
     reasoning = Column(Text, nullable=False)
     confidence_score = Column(Float, nullable=True)
+    evidence_type = Column(String, nullable=False, default="NO_EVIDENCE", server_default="NO_EVIDENCE")
     accepted_by_user = Column(Boolean, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)

@@ -7,13 +7,13 @@ from app.models.product_catalog import ProductCatalog
 from app.models.retailer_product import RetailerProduct
 from app.models.recommendation import Recommendation
 from app.models.user import User
-from app.services.pricing_workflow import compliance_node, route_identity, route_freshness, pricing_graph
+from app.services.pricing_workflow import compliance_node, persistence_node, route_identity, route_freshness, pricing_graph
 from scraping.scout import _failure_status
 
 
 def test_graph_has_bounded_four_agent_flow_nodes():
     nodes = set(pricing_graph.get_graph().nodes)
-    assert {"identity", "scout", "strategist", "compliance"}.issubset(nodes)
+    assert {"identity", "catalog_decision", "freshness", "scout", "rag", "strategist", "compliance", "persistence"}.issubset(nodes)
     assert route_identity({"error": "uncertain"}) == "stop"
     assert route_identity({"identity": {"decision": "MATCH"}}) == "catalog"
     assert route_freshness({"fresh": True}) == "rag"
@@ -47,9 +47,13 @@ def test_compliance_persists_only_margin_safe_evidence_based_price():
     session.add(catalog); session.flush()
     product = RetailerProduct(user_id=user.id, catalog_product_id=catalog.id, cost_price=100, stock_quantity=5, minimum_profit_margin=20)
     session.add(product); session.flush()
-    result = compliance_node({"db": session, "retailer_product_id": product.id, "competitors": [object()], "strategy": {"recommended_price": 125, "confidence": 0.8, "reasoning_summary": "Evidence-based."}})
+    state = {"db": session, "retailer_product_id": product.id, "competitors": [object()], "evidence_type": "LIVE", "strategy": {"recommended_price": 125, "confidence": 0.8, "reasoning_summary": "Evidence-based."}}
+    result = compliance_node(state)
     assert result["compliance"]["accepted"] is True
-    assert result["recommendation"].recommended_price == 125
+    assert session.query(Recommendation).count() == 0
+    state.update(result)
+    persisted = persistence_node(state)
+    assert persisted["recommendation"].recommended_price == 125
     assert session.query(Recommendation).count() == 1
     session.close(); engine.dispose()
 

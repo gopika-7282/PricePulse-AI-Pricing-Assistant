@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 # validator returns: platform, product_title, product_url, price, rating, availability, scraped_at
 
 
-def scrape_product(db: Session, catalog_product: ProductCatalog):
+def scrape_product(db: Session, catalog_product: ProductCatalog, platforms=None, max_products=None):
     """
     Integrates Playwright-based multi-platform scraping into the synchronous SQLAlchemy pipeline.
 
@@ -69,17 +69,27 @@ def scrape_product(db: Session, catalog_product: ProductCatalog):
             use_competitor_data = True
 
         if use_competitor_data and comp_data_fn is not None:
-            call_res = comp_data_fn(
-                product_name=catalog_product.name,
-                category=catalog_category,
-                product_details=catalog_details,
-            )
+            scrape_args = {
+                "product_name": catalog_product.name,
+                "category": catalog_category,
+                "product_details": catalog_details,
+            }
+            if platforms is not None:
+                scrape_args["platforms"] = platforms
+            if max_products is not None:
+                scrape_args["max_products"] = max_products
+            call_res = comp_data_fn(**scrape_args)
         else:
-            call_res = plat_status_fn(
-                product_name=catalog_product.name,
-                category=catalog_category,
-                product_details=catalog_details,
-            )
+            scrape_args = {
+                "product_name": catalog_product.name,
+                "category": catalog_category,
+                "product_details": catalog_details,
+            }
+            if platforms is not None:
+                scrape_args["platforms"] = platforms
+            if max_products is not None:
+                scrape_args["max_products"] = max_products
+            call_res = plat_status_fn(**scrape_args)
 
         if asyncio.iscoroutine(call_res) or isinstance(call_res, asyncio.Future):
             raw_output = loop.run_until_complete(call_res)
@@ -190,6 +200,9 @@ def scrape_product(db: Session, catalog_product: ProductCatalog):
                 else:
                     details_str = str(details) if details else ""
 
+                from app.utils.quantity import extract_quantity
+                quantity = extract_quantity(f"{data['product_title']} {details_str}") or {}
+
                 upsert_competitor_product(
                     db=db,
                     catalog_product_id=catalog_product.id,
@@ -199,7 +212,12 @@ def scrape_product(db: Session, catalog_product: ProductCatalog):
                     product_url=data.get("product_url"),
                     product_details=details_str,
                     rating=data.get("rating"),
-                    availability=data.get("availability", True),
+                    availability=data.get("availability"),
+                    quantity_value=data.get("quantity_value") or quantity.get("quantity_value"),
+                    quantity_unit=data.get("quantity_unit") or quantity.get("quantity_unit"),
+                    pack_count=data.get("pack_count") or quantity.get("pack_count"),
+                    total_quantity=data.get("total_quantity") or quantity.get("total_quantity"),
+                    total_quantity_unit=data.get("total_quantity_unit") or quantity.get("total_quantity_unit"),
                 )
                 stored_count += 1
 

@@ -19,6 +19,7 @@ import re
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from app.services.llm_service import generate_structured
+from app.config import OLLAMA_RELEVANCE_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -152,8 +153,8 @@ OUTPUT FORMAT (JSON object with 'results' array):
 
         llm_resp = generate_structured(
             prompt=prompt,
-            model="qwen3:8b",
-            timeout=25.0,
+            timeout=OLLAMA_RELEVANCE_TIMEOUT,
+            operation="scout_relevance",
         )
 
         llm_success = llm_resp.get("success") and llm_resp.get("data")

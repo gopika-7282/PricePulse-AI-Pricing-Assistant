@@ -10,8 +10,11 @@ from app.services.product_service import (
     update_retailer_product, delete_retailer_product
 )
 from app.schemas.retailer_product import RetailerProductResponse, ProductCreateRequest, ProductUpdateRequest
+import logging
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
 
 @router.post("", response_model=RetailerProductResponse, status_code=201)
 def create_product(
@@ -20,7 +23,7 @@ def create_product(
     current_user: User = Depends(get_current_user)
 ):
     try:
-        return create_retailer_product(
+        product = create_retailer_product(
             db=db,
             user_id=current_user.id,
             name=request.product_name,
@@ -29,8 +32,11 @@ def create_product(
             product_details=request.product_details,
             cost_price=request.cost_price,
             stock_quantity=request.stock_quantity,
-            minimum_profit_margin=request.minimum_profit_margin
+            minimum_profit_margin=request.minimum_profit_margin,
+            quantity_value=request.quantity_value,
+            quantity_unit=request.quantity_unit,
         )
+        return product
     except Exception:
         raise HTTPException(status_code=500, detail="Internal server error")
 
@@ -63,12 +69,23 @@ def update_product(
         db=db,
         product_id=product_id,
         user_id=current_user.id,
+        name=request.product_name,
+        category=request.category,
+        brand=request.brand,
+        product_details=request.product_details,
         cost_price=request.cost_price,
         stock_quantity=request.stock_quantity,
-        minimum_profit_margin=request.minimum_profit_margin
+        minimum_profit_margin=request.minimum_profit_margin,
+        quantity_value=request.quantity_value,
+        quantity_unit=request.quantity_unit,
     )
     if not product:
-        raise HTTPException(status_code=403, detail="Not allowed or product not found")
+        raise HTTPException(status_code=404, detail="Product not found")
+    try:
+        from app.services.ai.chroma_service import delete_retailer_product_context
+        delete_retailer_product_context(product_id, current_user.id)
+    except Exception:
+        logger.exception("Private product context reset failed for retailer_product_id=%s", product_id)
     return product
 
 @router.delete("/{product_id}", status_code=204)
@@ -77,7 +94,15 @@ def delete_product(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
+    product = get_retailer_product_by_id(db, product_id, current_user.id)
+    if not product:
+        raise HTTPException(status_code=404, detail="Product not found")
     success = delete_retailer_product(db, product_id, current_user.id)
     if not success:
-        raise HTTPException(status_code=403, detail="Not allowed or product not found")
+        raise HTTPException(status_code=404, detail="Product not found")
+    try:
+        from app.services.ai.chroma_service import delete_retailer_product_context
+        delete_retailer_product_context(product_id, current_user.id)
+    except Exception:
+        logger.exception("Private product context deletion failed for retailer_product_id=%s", product_id)
     return None

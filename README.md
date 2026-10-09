@@ -35,6 +35,16 @@ The current development focus is the complete end-to-end Agentic AI workflow,
 including product identity, catalog lifecycle, freshness management,
 marketplace scraping, RAG, pricing agents, and React integration.
 
+## Ollama timeout configuration
+
+Timeouts are positive finite seconds and are validated when the backend loads
+its configuration. Defaults are `OLLAMA_TIMEOUT=180` for general Ollama calls,
+`OLLAMA_IDENTITY_TIMEOUT=180` for Product Identity,
+`OLLAMA_RELEVANCE_TIMEOUT=45` for Scout relevance filtering, and
+`OLLAMA_STRATEGIST_TIMEOUT=180` for Strategist calls. Set any of these in the
+backend environment to override its default. The current compliance agent is
+deterministic and does not make an Ollama call.
+
 ---
 
 ## Core Workflow

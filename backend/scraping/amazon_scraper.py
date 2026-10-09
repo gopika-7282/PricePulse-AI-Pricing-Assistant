@@ -14,12 +14,63 @@ from playwright.async_api import async_playwright
 
 from scraping.base_scraper import BaseScraper
 from scraping.query_builder import focused_product_query
+from scraping.validator import validate_scraped_product
+from app.services.relevance_filter_service import filter_candidate_products
 
 logger = logging.getLogger(__name__)
 
 # Maximum products per platform - enforced hard cap at 10
 DEFAULT_MAX_PRODUCTS = 10
 HARD_MAX_PRODUCTS = 10
+
+
+def select_amazon_candidates(
+    candidates: List[Dict[str, Any]],
+    product_name: str,
+    category: Optional[str],
+    max_products: Optional[int],
+) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
+    """Deduplicate, validate and relevance-filter the full search result before capping."""
+    limit = min(max_products or DEFAULT_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
+    unique: List[Dict[str, Any]] = []
+    seen_ids = set()
+    for candidate in candidates:
+        asin = str(candidate.get("asin") or "").strip().upper()
+        url = str(candidate.get("product_url") or "").strip().rstrip("/").casefold()
+        identity = ("asin", asin) if asin else (("url", url) if url else None)
+        if identity is None or identity in seen_ids:
+            continue
+        seen_ids.add(identity)
+        unique.append(candidate)
+
+    validated: List[Dict[str, Any]] = []
+    for candidate in unique:
+        normalized = validate_scraped_product(candidate)
+        if normalized:
+            validated.append({**candidate, **normalized})
+
+    relevant = filter_candidate_products(
+        target_name=product_name,
+        target_category=category or "",
+        candidates=validated,
+    )
+    # Amazon's search result position is the existing relevance ranking. Preserve it
+    # while applying the hard cap only after validation and relevance filtering.
+    ranked = sorted(relevant, key=lambda product: product.get("ranking", 0))
+    selected = ranked[:limit]
+    counts = {
+        "parsed": len(candidates),
+        "unique": len(unique),
+        "validated": len(validated),
+        "relevant": len(relevant),
+        "ranked": len(ranked),
+        "selected": len(selected),
+    }
+    logger.info(
+        "[AMAZON_CANDIDATE_COUNTS] "
+        + " ".join(f"{name}={count}" for name, count in counts.items())
+    )
+    return selected, counts
 
 # Signals that Amazon is blocking automation
 AMAZON_BLOCK_SIGNALS = [
@@ -46,7 +97,7 @@ def build_amazon_query(
     Focused query builder for Amazon: 2-3 focused terms from product name and type.
     """
     focused = focused_product_query(product_name, category, product_details)
-    logger.info(f"[AMAZON_SCRAPER] Focused search query built: '{focused}'")
+    logger.info("[AMAZON_SCRAPER] Focused search query built")
     return focused
 
 
@@ -193,19 +244,16 @@ def _parse_amazon_search_page(html: str) -> List[Dict[str, Any]]:
                 "product_url": clean_url,
                 "price": price or 0.0,
                 "rating": rating,
-                "availability": True,
+                "availability": None,
                 "product_details": [],
                 "asin": asin,
                 "ranking": len(results) + 1,
             })
 
-            logger.info(
-                f"[AMAZON_SCRAPER] Candidate rank={len(results)}: '{title[:40]}' "
-                f"price={price} rating={rating}"
-            )
+            logger.debug("[AMAZON_SCRAPER] Candidate parsed rank=%d", len(results))
 
         except Exception as card_err:
-            logger.debug(f"[AMAZON_SCRAPER] Card parse error: {card_err}")
+            logger.debug("[AMAZON_SCRAPER] Card parse error: exception_class=%s", type(card_err).__name__)
             continue
 
     return results
@@ -224,7 +272,7 @@ def _parse_amazon_detail_page(html: str, url: str) -> Dict[str, Any]:
     price: Optional[float] = None
     rating: Optional[float] = None
     details_list: List[str] = []
-    availability = True
+    availability = None
 
     # LAYER 1: JSON-LD structured data
     for script in soup.find_all("script", type="application/ld+json"):
@@ -246,8 +294,11 @@ def _parse_amazon_detail_page(html: str, url: str) -> Dict[str, Any]:
                     if isinstance(offers, dict):
                         if price is None and offers.get("price"):
                             price = _parse_numeric_price(offers["price"])
-                        if "OutOfStock" in str(offers.get("availability", "")):
+                        offer_state = str(offers.get("availability", "")).casefold()
+                        if "outofstock" in offer_state:
                             availability = False
+                        elif "instock" in offer_state:
+                            availability = True
                     agg = item.get("aggregateRating", {})
                     if isinstance(agg, dict) and rating is None:
                         rating = _parse_numeric_rating(agg.get("ratingValue"))
@@ -316,8 +367,11 @@ def _parse_amazon_detail_page(html: str, url: str) -> Dict[str, Any]:
     # Availability
     avail_el = soup.find(id="availability")
     if avail_el:
-        if any(phrase in avail_el.text.lower() for phrase in ["currently unavailable", "out of stock"]):
+        availability_text = avail_el.text.casefold()
+        if any(phrase in availability_text for phrase in ["currently unavailable", "out of stock"]):
             availability = False
+        elif "in stock" in availability_text:
+            availability = True
 
     return {
         "product_name": product_name,
@@ -354,12 +408,17 @@ class AmazonScraper(BaseScraper):
         encoded_query = urllib.parse.quote(query)
         search_url = f"https://www.amazon.in/s?k={encoded_query}"
 
-        logger.info(f"[AMAZON_SCRAPING_STARTED] Navigating to search URL: {search_url}")
+        logger.info("[AMAZON_SCRAPING_STARTED] platform=Amazon stage=search")
         self.search_result_status = "PARSE_ERROR"
-        nav_ok = await self.safe_navigate(page, search_url, wait_until="domcontentloaded")
+        nav_ok = await self.safe_navigate(page, search_url, wait_until="domcontentloaded", platform="Amazon", stage="search")
 
         if not nav_ok:
             self.search_result_status = self.last_navigation_status or "NETWORK_ERROR"
+            self.log_diagnostic("Amazon", "search", requested_url=search_url,
+                                final_url=getattr(page, "url", None), navigation="failure",
+                                challenge=None, challenge_reason="not_checked_navigation_failure",
+                                product_card_count=0, normalized_product_count=0,
+                                reason_category=self.result_reason_category(self.search_result_status))
             logger.error("[AMAZON_SCRAPING_FAILED] reason=page_navigation_error")
             return [], False
 
@@ -372,21 +431,31 @@ class AmazonScraper(BaseScraper):
 
         if not html or len(html) < 500:
             self.search_result_status = self.last_navigation_status or "PARSE_ERROR"
+            self.log_diagnostic("Amazon", "search", requested_url=search_url, final_url=current_url,
+                                challenge=None, challenge_reason="not_checked_short_or_empty_page",
+                                product_card_count=0, normalized_product_count=0,
+                                reason_category="empty_page_content")
             logger.error("[AMAZON_SCRAPING_FAILED] reason=empty_page_content")
             return [], False
 
         # Block detection -- check before parsing
-        if _is_amazon_blocked(html, current_url):
-            logger.warning(
-                f"[AMAZON_SCRAPING_BLOCKED] Automation challenge detected at URL: {current_url[:80]}"
-            )
+        challenge_detected = _is_amazon_blocked(html, current_url)
+        self.log_diagnostic("Amazon", "search", requested_url=search_url, final_url=current_url,
+                            challenge=challenge_detected,
+                            challenge_reason=self.challenge_reason_category(
+                                challenge_detected, html, current_url,
+                                url_markers=("errors/validateCaptcha", "/ap/cvf/"),
+                                html_markers=AMAZON_BLOCK_SIGNALS,
+                            ))
+        if challenge_detected:
             return [], True
 
         logger.info("[AMAZON_PAGE_RENDERED] Search page content captured successfully.")
         candidates = _parse_amazon_search_page(html)
         if not candidates:
             self.search_result_status = self.last_navigation_status or self.classify_empty_search(html)
-        logger.info(f"[AMAZON_DATA_EXTRACTED] Search page candidates discovered: {len(candidates)}")
+        self.log_diagnostic("Amazon", "search_parse", requested_url=search_url, final_url=current_url,
+                            product_card_count=len(candidates))
         return candidates, False
 
     async def _fetch_detail_page(
@@ -401,26 +470,43 @@ class AmazonScraper(BaseScraper):
             logger.warning(f"[AMAZON_SCRAPER] Skipping candidate {idx}/{total}: empty URL.")
             return {}
 
-        logger.info(f"[AMAZON_SCRAPER] Detail page {idx}/{total}: {cand_url[:80]}")
+        logger.info("[AMAZON_SCRAPER] platform=Amazon stage=detail candidate=%d/%d", idx, total)
 
-        # Rate limiting: small delay between detail page requests
-        await page.wait_for_timeout(1800)
+        # Keep a bounded pause between product detail requests.
+        await page.wait_for_timeout(1000)
 
         try:
-            await page.goto(cand_url, wait_until="domcontentloaded", timeout=25000)
-            await page.wait_for_timeout(2500)
-            detail_html = await page.content()
+            await page.goto(cand_url, wait_until="domcontentloaded", timeout=10000)
         except Exception as e:
-            logger.warning(
-                f"[AMAZON_SCRAPER] Detail page load failed for {cand_url[:60]}: {e}. "
-                "Using search card fallback."
-            )
+            self.log_diagnostic("Amazon", "detail", requested_url=cand_url,
+                                final_url=getattr(page, "url", None), navigation="failure",
+                                exception=e, reason_category="detail_navigation_failure")
+            logger.warning("[AMAZON_SCRAPER] Detail page load failed; using search card fallback. exception_class=%s",
+                           type(e).__name__)
             detail_html = ""
+        else:
+            self.log_diagnostic("Amazon", "detail", requested_url=cand_url,
+                                final_url=getattr(page, "url", None), navigation="success")
+            try:
+                await page.wait_for_timeout(500)
+                detail_html = await page.content()
+            except Exception as e:
+                self.log_diagnostic("Amazon", "detail_capture", requested_url=cand_url,
+                                    final_url=getattr(page, "url", None), navigation="success",
+                                    exception=e, reason_category="page_capture_failure")
+                detail_html = ""
 
         # Check if detail page is also blocked
-        if detail_html and _is_amazon_blocked(detail_html, page.url):
+        detail_challenge = _is_amazon_blocked(detail_html, page.url) if detail_html else False
+        self.log_diagnostic("Amazon", "detail", requested_url=cand_url,
+                            final_url=getattr(page, "url", None), challenge=detail_challenge,
+                            challenge_reason=self.challenge_reason_category(
+                                detail_challenge, detail_html, getattr(page, "url", ""),
+                                url_markers=("errors/validateCaptcha", "/ap/cvf/"),
+                                html_markers=AMAZON_BLOCK_SIGNALS,
+                            ) if detail_html else "not_checked_no_html")
+        if detail_challenge:
             self.challenge_detected = True
-            logger.warning(f"[AMAZON_SCRAPING_BLOCKED] Detail page blocked for {cand_url[:60]}")
             detail_html = ""
 
         detailed: Dict[str, Any] = {}
@@ -440,19 +526,41 @@ class AmazonScraper(BaseScraper):
                 if detailed.get("rating") is not None
                 else cand.get("rating")
             ),
-            "availability": detailed.get("availability", cand.get("availability", True)),
+            "availability": (detailed.get("availability") if detailed.get("availability") is not None
+                             else cand.get("availability")),
             "product_details": detailed.get("product_details") or cand.get("product_details", []),
             "scraped_at": scraped_at,
             "ranking": cand.get("ranking", idx),
         }
 
-        if merged["product_title"]:
-            logger.info(
-                f"[AMAZON_DATA_EXTRACTED] Product {idx}: '{merged['product_title'][:40]}' "
-                f"price={merged['price']} rating={merged['rating']}"
-            )
+        self.log_diagnostic("Amazon", "detail_parse", requested_url=cand_url,
+                            final_url=getattr(page, "url", None),
+                            normalized_product_count=1 if merged["product_title"] else 0,
+                            reason_category="parsed" if merged["product_title"] else "missing_product_title")
 
         return merged
+
+    async def _enrich_selected_candidates(
+        self, page: Any, candidates: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Enrich each selected result independently; retain valid search-card data on failure."""
+        products: List[Dict[str, Any]] = []
+        for idx, candidate in enumerate(candidates, 1):
+            try:
+                product = await self._fetch_detail_page(page, candidate, idx, len(candidates))
+            except Exception as exc:
+                logger.warning("[AMAZON_SCRAPER] Detail enrichment failed for candidate %s/%s; using search card data. exception_class=%s",
+                               idx, len(candidates), type(exc).__name__)
+                product = {}
+            if not product or not product.get("product_title"):
+                product = {
+                    **candidate,
+                    "platform": "Amazon",
+                    "scraped_at": datetime.now(timezone.utc).isoformat(),
+                }
+            if product.get("product_title"):
+                products.append(product)
+        return products
 
     async def scrape_amazon(
         self,
@@ -471,10 +579,7 @@ class AmazonScraper(BaseScraper):
         limit = min(max_products or DEFAULT_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
         query = build_amazon_query(product_name, category, product_details)
 
-        logger.info(
-            f"[AMAZON_SCRAPING_STARTED] product='{product_name}' "
-            f"query='{query}' max_products={limit}"
-        )
+        logger.info("[AMAZON_SCRAPING_STARTED] platform=Amazon stage=scrape max_products=%d", limit)
 
         products: List[Dict[str, Any]] = []
         self.challenge_detected = False
@@ -506,17 +611,14 @@ class AmazonScraper(BaseScraper):
                             "error": self.search_failure_message(),
                         }
 
-                    selected = candidates[:limit]
-                    logger.info(
-                        f"[AMAZON_SCRAPER] Processing {len(selected)} candidates "
-                        f"(of {len(candidates)} found)"
+                    selected, _candidate_counts = select_amazon_candidates(
+                        candidates, product_name, category, limit
                     )
+                    self.log_diagnostic("Amazon", "candidate_selection", product_card_count=len(candidates),
+                                        normalized_product_count=len(selected), reason_category="relevance_filtered")
 
                     # Phase 2: Detail pages
-                    for idx, cand in enumerate(selected, 1):
-                        product = await self._fetch_detail_page(page, cand, idx, len(selected))
-                        if product and product.get("product_title"):
-                            products.append(product)
+                    products = await self._enrich_selected_candidates(page, selected)
 
                     if self.challenge_detected:
                         return {"platform": "Amazon", "status": "BLOCKED", "products": [], "error": "Security challenge detected on a product detail page"}
@@ -525,7 +627,8 @@ class AmazonScraper(BaseScraper):
                     await self.close_session(browser, context)
 
         except asyncio.TimeoutError as te:
-            logger.error(f"[AMAZON_SCRAPING_FAILED] Timeout: {te}")
+            logger.error("[AMAZON_SCRAPING_FAILED] platform=Amazon reason_category=timeout exception_class=%s",
+                         type(te).__name__)
             return {
                 "platform": "Amazon",
                 "status": "TIMEOUT",
@@ -533,10 +636,8 @@ class AmazonScraper(BaseScraper):
                 "error": str(te),
             }
         except Exception as e:
-            logger.error(
-                f"[AMAZON_SCRAPING_FAILED] Unexpected error during scraping: {e}",
-                exc_info=True,
-            )
+            logger.error("[AMAZON_SCRAPING_FAILED] platform=Amazon reason_category=scraper_failure exception_class=%s",
+                         type(e).__name__)
             return {
                 "platform": "Amazon",
                 "status": "PARSE_ERROR",
@@ -544,10 +645,9 @@ class AmazonScraper(BaseScraper):
                 "error": str(e),
             }
 
-        logger.info(
-            f"[AMAZON_SCRAPING_COMPLETED] product='{product_name}' "
-            f"results_collected={len(products)}"
-        )
+        self.log_diagnostic("Amazon", "scrape", normalized_product_count=len(products),
+                            final_status="SUCCESS" if products else "EMPTY",
+                            reason_category="success" if products else "no_products")
         return {
             "platform": "Amazon",
             "status": "SUCCESS" if products else "EMPTY",
@@ -576,7 +676,7 @@ class AmazonScraper(BaseScraper):
         }
 
         for attempt_num in range(1, self.max_retries + 1):
-            logger.info(f"[AMAZON_SCRAPER] Scrape attempt {attempt_num}/{self.max_retries}")
+            logger.info("[AMAZON_SCRAPER] platform=Amazon stage=attempt attempt=%d/%d", attempt_num, self.max_retries)
             try:
                 result = await self.scrape_amazon(
                     product_name, category, product_details, max_products
@@ -584,6 +684,9 @@ class AmazonScraper(BaseScraper):
                 status = self.classify_status(result.get("status"), result.get("error"))
                 result = {**result, "status": status}
                 last_result = result
+                self.log_diagnostic("Amazon", "attempt_result", final_status=status,
+                                    reason_category=self.result_reason_category(status),
+                                    normalized_product_count=len(result.get("products") or []))
 
                 # Do NOT retry if blocked
                 if result.get("status") == "BLOCKED":
@@ -613,14 +716,14 @@ class AmazonScraper(BaseScraper):
                 }
                 if status not in {"NETWORK_ERROR", "TIMEOUT"}:
                     return last_result
-                logger.warning(f"[AMAZON_SCRAPER] Attempt {attempt_num} raised exception: {e}")
+                self.log_diagnostic("Amazon", "attempt_result", final_status=status,
+                                    reason_category=self.result_reason_category(status), exception=e)
 
             if attempt_num < self.max_retries:
                 wait_secs = 2 ** attempt_num
                 logger.info(f"[AMAZON_SCRAPER] Retrying in {wait_secs}s...")
                 await asyncio.sleep(wait_secs)
 
-        logger.error(
-            f"[AMAZON_SCRAPING_FAILED] All {self.max_retries} attempts failed for '{product_name}'."
-        )
+        logger.error("[AMAZON_SCRAPING_FAILED] platform=Amazon reason_category=%s status=%s",
+                     self.result_reason_category(last_result.get("status")), last_result.get("status"))
         return last_result

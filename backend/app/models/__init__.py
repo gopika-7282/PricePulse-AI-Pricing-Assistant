@@ -7,3 +7,4 @@ from app.models.competitor_price_history import CompetitorPriceHistory
 from app.models.price_analysis import PriceAnalysis
 from app.models.recommendation import Recommendation
 from app.models.agent_log import AgentLog
+from app.models.chat import ChatConversation, ChatMessage

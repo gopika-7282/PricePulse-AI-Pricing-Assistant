@@ -309,7 +309,7 @@ def parse_search_page(html: str, query: str = "") -> List[Dict[str, Any]]:
                 "product_details": [],
                 "price": price or 0.0,
                 "rating": rating,
-                "availability": True,
+                "availability": None,
                 "ranking": len(results) + 1,  # Sequential ranking in search results
             }
             results.append(item)
@@ -342,7 +342,7 @@ def parse_detail_page(html: str, url: str) -> Dict[str, Any]:
     price: Optional[float] = None
     rating: Optional[float] = None
     product_details_list: List[str] = []
-    availability = True
+    availability = None
 
     # ──────────────────────────────────────────────────────────────────────────
     # LAYER 1: Parse structured schema metadata (<script type="application/ld+json">)
@@ -372,6 +372,8 @@ def parse_detail_page(html: str, url: str) -> Dict[str, Any]:
                         avail_str = str(offers.get("availability", ""))
                         if "OutOfStock" in avail_str:
                             availability = False
+                        elif "InStock" in avail_str:
+                            availability = True
 
                     agg_rating = item.get("aggregateRating")
                     if isinstance(agg_rating, dict) and rating is None:

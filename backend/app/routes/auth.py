@@ -36,7 +36,9 @@ def forgot_password(request: ForgotPasswordRequest, db: Session = Depends(get_db
 
 @router.post("/reset-password")
 def reset_password(request: ResetPasswordRequest, db: Session = Depends(get_db)):
-    return process_reset_password(db, request.token, request.new_password)
+    if not process_reset_password(db, request.token, request.new_password):
+        raise HTTPException(status_code=400, detail="This password-reset link is invalid or has expired. Request a new one.")
+    return {"message": "Password reset successful. Please sign in with your new password."}
 
 @router.get("/me", response_model=UserResponse)
 def read_current_user(current_user: User = Depends(get_current_user)):

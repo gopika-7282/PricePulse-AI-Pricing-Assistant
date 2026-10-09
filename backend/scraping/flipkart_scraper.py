@@ -79,7 +79,7 @@ def build_flipkart_query(
     Avoids long description dumping.
     """
     focused = focused_product_query(product_name, category, product_details)
-    logger.info(f"[FLIPKART_SCRAPER] Focused search query built: '{focused}'")
+    logger.info("[FLIPKART_SCRAPER] Focused search query built")
     return focused
 
 
@@ -117,12 +117,17 @@ class FlipkartScraper(BaseScraper):
         encoded_query = urllib.parse.quote(query)
         search_url = f"https://www.flipkart.com/search?q={encoded_query}"
 
-        logger.info(f"[FLIPKART_SCRAPING_STARTED] Navigating to search URL: {search_url}")
+        logger.info("[FLIPKART_SCRAPING_STARTED] platform=Flipkart stage=search")
         self.search_result_status = "PARSE_ERROR"
-        nav_ok = await self.safe_navigate(page, search_url, wait_until="domcontentloaded")
+        nav_ok = await self.safe_navigate(page, search_url, wait_until="domcontentloaded", platform="Flipkart", stage="search")
 
         if not nav_ok:
             self.search_result_status = self.last_navigation_status or "NETWORK_ERROR"
+            self.log_diagnostic("Flipkart", "search", requested_url=search_url,
+                                final_url=getattr(page, "url", None), navigation="failure",
+                                challenge=None, challenge_reason="not_checked_navigation_failure",
+                                product_card_count=0, normalized_product_count=0,
+                                reason_category=self.result_reason_category(self.search_result_status))
             logger.error("[FLIPKART_SCRAPING_FAILED] reason=page_navigation_error")
             return [], False
 
@@ -135,20 +140,29 @@ class FlipkartScraper(BaseScraper):
         html = await page.content()
         if not html or len(html) < 500:
             self.search_result_status = self.last_navigation_status or "PARSE_ERROR"
+            self.log_diagnostic("Flipkart", "search", requested_url=search_url, final_url=current_url,
+                                challenge=None, challenge_reason="not_checked_short_or_empty_page",
+                                product_card_count=0, normalized_product_count=0,
+                                reason_category="empty_page_content")
             logger.error("[FLIPKART_SCRAPING_FAILED] reason=empty_page_content")
             return [], False
 
-        if _is_flipkart_blocked(html, current_url):
-            logger.warning(
-                f"[FLIPKART_SCRAPING_BLOCKED] Bot challenge detected at URL: {current_url[:80]}"
-            )
+        challenge_detected = _is_flipkart_blocked(html, current_url)
+        self.log_diagnostic("Flipkart", "search", requested_url=search_url, final_url=current_url,
+                            challenge=challenge_detected,
+                            challenge_reason=self.challenge_reason_category(
+                                challenge_detected, html, current_url,
+                                html_markers=FLIPKART_BLOCK_SIGNALS,
+                            ))
+        if challenge_detected:
             return [], True
 
         logger.info("[PAGE_RENDERED] Search page content captured successfully.")
         candidates = parse_search_page(html, query=query)
         if not candidates:
             self.search_result_status = self.last_navigation_status or self.classify_empty_search(html)
-        logger.info(f"[DATA_EXTRACTED] Search page candidates discovered: {len(candidates)}")
+        self.log_diagnostic("Flipkart", "search_parse", requested_url=search_url, final_url=current_url,
+                            product_card_count=len(candidates))
         return candidates, False
 
     async def _fetch_detail_page(
@@ -163,18 +177,32 @@ class FlipkartScraper(BaseScraper):
             logger.warning(f"[FLIPKART_SCRAPER] Skipping candidate {idx}/{total}: empty URL.")
             return {}
 
-        logger.info(f"[FLIPKART_SCRAPER] Detail page {idx}/{total}: {cand_url[:80]}")
+        logger.info("[FLIPKART_SCRAPER] platform=Flipkart stage=detail candidate=%d/%d", idx, total)
 
         try:
             await page.goto(cand_url, wait_until="domcontentloaded", timeout=20000)
-            await page.wait_for_timeout(3000)  # Allow JS/React spec tables to hydrate
-            detail_html = await page.content()
         except Exception as e:
-            logger.warning(
-                f"[FLIPKART_SCRAPER] Detail page load failed for {cand_url[:60]}: {e}. "
-                "Using search card fallback."
-            )
+            self.log_diagnostic("Flipkart", "detail", requested_url=cand_url,
+                                final_url=getattr(page, "url", None), navigation="failure",
+                                exception=e, reason_category="detail_navigation_failure")
+            logger.warning("[FLIPKART_SCRAPER] Detail page load failed; using search card fallback. exception_class=%s",
+                           type(e).__name__)
             detail_html = ""
+        else:
+            self.log_diagnostic("Flipkart", "detail", requested_url=cand_url,
+                                final_url=getattr(page, "url", None), navigation="success")
+            try:
+                await page.wait_for_timeout(3000)  # Allow JS/React spec tables to hydrate
+                detail_html = await page.content()
+            except Exception as e:
+                self.log_diagnostic("Flipkart", "detail_capture", requested_url=cand_url,
+                                    final_url=getattr(page, "url", None), navigation="success",
+                                    exception=e, reason_category="page_capture_failure")
+                detail_html = ""
+
+        self.log_diagnostic("Flipkart", "detail", requested_url=cand_url,
+                            final_url=getattr(page, "url", None), challenge=None,
+                            challenge_reason="not_checked_no_flipkart_detail_detector")
 
         if detail_html and len(detail_html) > 500:
             logger.info(f"[PAGE_RENDERED] Detail page rendered for candidate {idx}/{total}.")
@@ -194,17 +222,17 @@ class FlipkartScraper(BaseScraper):
                 if detailed.get("rating") is not None
                 else cand.get("rating")
             ),
-            "availability": detailed.get("availability", cand.get("availability", True)),
+            "availability": (detailed.get("availability") if detailed.get("availability") is not None
+                             else cand.get("availability")),
             "product_details": detailed.get("product_details") or cand.get("product_details", []),
             "scraped_at": scraped_at,
             "ranking": cand.get("ranking", idx),
         }
 
-        if merged["product_title"]:
-            logger.info(
-                f"[DATA_EXTRACTED] Product {idx}: '{merged['product_title'][:40]}' "
-                f"price={merged['price']} rating={merged['rating']}"
-            )
+        self.log_diagnostic("Flipkart", "detail_parse", requested_url=cand_url,
+                            final_url=getattr(page, "url", None),
+                            normalized_product_count=1 if merged["product_title"] else 0,
+                            reason_category="parsed" if merged["product_title"] else "missing_product_title")
 
         return merged
 
@@ -223,10 +251,7 @@ class FlipkartScraper(BaseScraper):
         limit = min(max_products or DEFAULT_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
         query = build_flipkart_query(product_name, category, product_details)
 
-        logger.info(
-            f"[FLIPKART_SCRAPING_STARTED] product='{product_name}' "
-            f"query='{query}' max_products={limit}"
-        )
+        logger.info("[FLIPKART_SCRAPING_STARTED] platform=Flipkart stage=scrape max_products=%d", limit)
 
         results: List[Dict[str, Any]] = []
 
@@ -258,10 +283,8 @@ class FlipkartScraper(BaseScraper):
                         }
 
                     selected = candidates[:limit]
-                    logger.info(
-                        f"[FLIPKART_SCRAPER] Processing {len(selected)} candidates "
-                        f"(of {len(candidates)} found)"
-                    )
+                    self.log_diagnostic("Flipkart", "candidate_selection", product_card_count=len(candidates),
+                                        reason_category="selection_complete")
 
                     # Phase 2: Detail pages
                     for idx, cand in enumerate(selected, 1):
@@ -273,7 +296,8 @@ class FlipkartScraper(BaseScraper):
                     await self.close_session(browser, context)
 
         except PlaywrightTimeoutError as te:
-            logger.error(f"[FLIPKART_SCRAPING_FAILED] Timeout: {te}")
+            logger.error("[FLIPKART_SCRAPING_FAILED] platform=Flipkart reason_category=timeout exception_class=%s",
+                         type(te).__name__)
             return {
                 "platform": "Flipkart",
                 "status": "TIMEOUT",
@@ -281,10 +305,8 @@ class FlipkartScraper(BaseScraper):
                 "error": str(te),
             }
         except Exception as e:
-            logger.error(
-                f"[FLIPKART_SCRAPING_FAILED] Unexpected error during scraping: {e}",
-                exc_info=True,
-            )
+            logger.error("[FLIPKART_SCRAPING_FAILED] platform=Flipkart reason_category=scraper_failure exception_class=%s",
+                         type(e).__name__)
             return {
                 "platform": "Flipkart",
                 "status": "PARSE_ERROR",
@@ -292,10 +314,9 @@ class FlipkartScraper(BaseScraper):
                 "error": str(e),
             }
 
-        logger.info(
-            f"[FLIPKART_SCRAPING_COMPLETED] product='{product_name}' "
-            f"results_collected={len(results)}"
-        )
+        self.log_diagnostic("Flipkart", "scrape", normalized_product_count=len(results),
+                            final_status="SUCCESS" if results else "EMPTY",
+                            reason_category="success" if results else "no_products")
         return {
             "platform": "Flipkart",
             "status": "SUCCESS" if results else "EMPTY",
@@ -323,6 +344,9 @@ class FlipkartScraper(BaseScraper):
 
                 status = self.classify_status(res.get("status"), res.get("error"))
                 res = {**res, "status": status}
+                self.log_diagnostic("Flipkart", "attempt_result", final_status=status,
+                                    reason_category=self.result_reason_category(status),
+                                    normalized_product_count=len(res.get("products") or []))
                 if status in {"SUCCESS", "BLOCKED", "EMPTY", "PARSE_ERROR"}:
                     return res
 
@@ -335,6 +359,8 @@ class FlipkartScraper(BaseScraper):
                     return res
             except Exception as e:
                 status = self.classify_status("FAILED", e)
+                self.log_diagnostic("Flipkart", "attempt_result", final_status=status,
+                                    reason_category=self.result_reason_category(status), exception=e)
                 if status not in {"NETWORK_ERROR", "TIMEOUT"} or attempt_num >= self.max_retries:
                     return {
                         "platform": "Flipkart",
