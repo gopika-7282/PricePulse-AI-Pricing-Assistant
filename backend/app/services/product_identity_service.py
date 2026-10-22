@@ -44,6 +44,12 @@ STOP_WORDS: Set[str] = {
     "natural", "organic", "herbal", "original", "item", "product"
 }
 
+# These are identity-bearing ingredients, unlike generic listing language such
+# as "natural", "extract", "bar", or "bathing". Keep this deliberately small:
+# uncertain ingredient equivalence remains the LLM's responsibility.
+IDENTITY_INGREDIENTS: Set[str] = {"turmeric", "neem"}
+PRODUCT_TYPES: Set[str] = {"soap", "shampoo", "facewash", "face", "wash", "cleanser", "cake"}
+
 
 class IdentityDecision(str, Enum):
     MATCH = "MATCH"
@@ -71,6 +77,37 @@ def extract_search_tokens(text: str) -> List[str]:
         return []
     raw_tokens = re.findall(r"[a-zA-Z0-9]+", text.lower())
     return [t for t in raw_tokens if len(t) >= 3 and t not in STOP_WORDS]
+
+
+def _identity_tokens(text: str) -> Set[str]:
+    return set(extract_search_tokens(text))
+
+
+def _deterministic_identity(candidate: ProductCatalog, name: str, details: str) -> Optional[bool]:
+    """Return True/False only for high-confidence identity evidence."""
+    incoming_name = _identity_tokens(name)
+    candidate_name = _identity_tokens(candidate.name or "")
+    incoming_evidence = incoming_name | _identity_tokens(details)
+    candidate_evidence = candidate_name | _identity_tokens(candidate.product_details or "")
+
+    incoming_types = incoming_evidence & PRODUCT_TYPES
+    candidate_types = candidate_evidence & PRODUCT_TYPES
+    if incoming_types and candidate_types and incoming_types.isdisjoint(candidate_types):
+        return False
+
+    incoming_ingredients = incoming_evidence & IDENTITY_INGREDIENTS
+    candidate_ingredients = candidate_evidence & IDENTITY_INGREDIENTS
+    if incoming_ingredients and candidate_ingredients and incoming_ingredients.isdisjoint(candidate_ingredients):
+        return False
+
+    # Exact generic product identity is safe to resolve without a model call.
+    # Ignore descriptors, brands, and categories; retain product type and
+    # identity-bearing name tokens to avoid merging distinct variants.
+    incoming_core = incoming_name - PRODUCT_TYPES
+    candidate_core = candidate_name - PRODUCT_TYPES
+    if incoming_core == candidate_core and incoming_core:
+        return True
+    return None
 
 
 def retrieve_postgres_candidates(
@@ -245,6 +282,26 @@ def evaluate_product_identity(
             confidence=1.0,
             reason="Catalog contains no candidates",
             identity_factors=["empty_catalog"],
+        )
+
+    # Resolve only clear-cut identity cases deterministically. This keeps basic
+    # catalog reuse available when Ollama is offline and prevents explicit
+    # ingredient/type conflicts from being overridden by generic word overlap.
+    decisions = [(candidate, _deterministic_identity(candidate, product_name, product_details))
+                 for candidate in candidates]
+    for candidate, decision in decisions:
+        if decision is True:
+            return IdentityOutput(
+                decision=IdentityDecision.MATCH, matched_catalog_id=candidate.id,
+                confidence=1.0, reason="Same generic product identity; brand is supporting metadata",
+                identity_factors=["product_name_identity", "brand_neutral"],
+            )
+    candidates = [candidate for candidate, decision in decisions if decision is not False]
+    if not candidates:
+        return IdentityOutput(
+            decision=IdentityDecision.NOT_MATCH, confidence=1.0,
+            reason="Product type or identity-bearing ingredient conflicts",
+            identity_factors=["identity_conflict"],
         )
 
     candidate_ids = {c.id for c in candidates}

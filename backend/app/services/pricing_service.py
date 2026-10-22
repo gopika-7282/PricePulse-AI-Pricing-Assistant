@@ -12,7 +12,13 @@ logger = logging.getLogger(__name__)
 
 def minimum_viable_selling_price(cost_price: float, minimum_profit_margin: float) -> float:
     """Single pricing rule for the retailer's non-negotiable minimum margin."""
-    return float(cost_price) * (1 + float(minimum_profit_margin) / 100.0)
+    cost = float(cost_price)
+    margin = float(minimum_profit_margin)
+    if cost <= 0:
+        raise ValueError("Cost price must be greater than zero")
+    if margin < 0:
+        raise ValueError("Minimum profit margin cannot be negative")
+    return cost * (1 + margin / 100.0)
 
 def calculate_market_average(db: Session, catalog_product_id: int) -> dict:
     all_competitors = db.query(CompetitorProduct).filter(CompetitorProduct.catalog_product_id == catalog_product_id).all()
@@ -43,6 +49,8 @@ def calculate_price_analysis(db: Session, retailer_product_id: int) -> PriceAnal
     retailer_prod = db.query(RetailerProduct).filter(RetailerProduct.id == retailer_product_id).first()
     if not retailer_prod:
         raise ValueError("Retailer product not found")
+    if retailer_prod.cost_price <= 0:
+        raise ValueError("Cost price must be greater than zero")
         
     market_stats = calculate_market_average(db, retailer_prod.catalog_product_id)
     

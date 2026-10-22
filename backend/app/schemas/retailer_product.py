@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from datetime import datetime
 
 class ProductUpdateRequest(BaseModel):
@@ -6,11 +6,11 @@ class ProductUpdateRequest(BaseModel):
     category: str
     brand: str
     product_details: str
-    cost_price: float
-    stock_quantity: int
+    cost_price: float = Field(gt=0)
+    stock_quantity: int = Field(ge=0)
     quantity_value: float | None = None
     quantity_unit: str | None = None
-    minimum_profit_margin: float
+    minimum_profit_margin: float = Field(ge=0)
 
     @model_validator(mode="after")
     def validate_pack_quantity(self):
@@ -29,11 +29,11 @@ class ProductCreateRequest(ProductUpdateRequest):
 
 class RetailerProductCreate(BaseModel):
     catalog_product_id: int
-    cost_price: float
-    stock_quantity: int
+    cost_price: float = Field(gt=0)
+    stock_quantity: int = Field(ge=0)
     quantity_value: float | None = None
     quantity_unit: str | None = None
-    minimum_profit_margin: float
+    minimum_profit_margin: float = Field(ge=0)
 
 class RetailerProductResponse(BaseModel):
     id: int

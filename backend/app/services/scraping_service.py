@@ -55,9 +55,6 @@ def scrape_product(db: Session, catalog_product: ProductCatalog, platforms=None,
     catalog_details = getattr(catalog_product, 'product_details', None)
 
     try:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
         # Detect if running under tests that patched get_competitor_data
         comp_data_fn = getattr(scraper, "get_competitor_data", None)
         plat_status_fn = getattr(scraper, "get_platform_statuses", None)
@@ -92,10 +89,16 @@ def scrape_product(db: Session, catalog_product: ProductCatalog, platforms=None,
             call_res = plat_status_fn(**scrape_args)
 
         if asyncio.iscoroutine(call_res) or isinstance(call_res, asyncio.Future):
-            raw_output = loop.run_until_complete(call_res)
+            # Synchronous scraper/test adapters need no event loop. Creating a
+            # Windows Proactor loop for every call can block even when nothing
+            # is awaited; construct one only for an actual async result.
+            loop = asyncio.new_event_loop()
+            try:
+                raw_output = loop.run_until_complete(call_res)
+            finally:
+                loop.close()
         else:
             raw_output = call_res
-        loop.close()
 
         if isinstance(raw_output, list):
             prods = raw_output

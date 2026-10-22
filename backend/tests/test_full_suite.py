@@ -287,6 +287,20 @@ class TestSemanticMatching:
         )
         assert match is None
 
+    def test_generic_word_overlap_does_not_override_ingredient_conflict(self, db):
+        cat = ProductCatalog(
+            name="Turmeric Soap", category="Personal Care", brand="One",
+            product_details="Natural turmeric extract bathing bar",
+        )
+        db.add(cat)
+        db.flush()
+
+        match = find_catalog_match(
+            db, name="Neem Soap", category="Personal Care", brand="Two",
+            details="Natural neem extract bathing bar",
+        )
+        assert match is None
+
     def test_09_completely_different_domain(self, db):
         """Scenario 9: Turmeric Soap vs Chocolate Cake => NO MATCH"""
         cat = ProductCatalog(

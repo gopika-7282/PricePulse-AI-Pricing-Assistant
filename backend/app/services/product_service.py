@@ -30,17 +30,14 @@ def create_product_catalog(
 
 
 def find_existing_product(db: Session, name: str, category: str = "", brand: str = "") -> Optional[ProductCatalog]:
-    """Compatibility lookup that delegates identity semantics to the canonical Qwen service.
+    """Compatibility lookup that delegates to the canonical matching service.
 
     The retailer pricing workflow does not call this helper; its LangGraph identity
     and catalog-decision nodes remain authoritative for create/edit lifecycle.
     """
-    from app.services.product_identity_service import evaluate_product_identity
+    from app.services.matching_service import find_catalog_match
 
-    result = evaluate_product_identity(db, name, "", category, brand)
-    if result.decision.value != "MATCH" or not result.matched_catalog_id:
-        return None
-    return db.query(ProductCatalog).filter(ProductCatalog.id == result.matched_catalog_id).first()
+    return find_catalog_match(db, name=name, category=category, brand=brand)
 
 
 

@@ -11,6 +11,8 @@ from app.models.product_catalog import ProductCatalog
 from app.models.retailer_product import RetailerProduct
 from app.models.user import User
 from app.services.pricing_workflow import strategist_node
+from app.services.pricing_service import minimum_viable_selling_price
+from app.schemas.retailer_product import ProductCreateRequest
 
 
 def _session_with_product(quantity_value=100, quantity_unit="ml"):
@@ -35,6 +37,26 @@ def _competitor(catalog, platform, price, quantity_value=None, quantity_unit=Non
     return CompetitorProduct(catalog_product_id=catalog.id, platform_name=platform,
                              product_name=f"{platform} hair oil", price=price,
                              quantity_value=quantity_value, quantity_unit=quantity_unit)
+
+
+def test_product_request_rejects_invalid_pricing_inputs():
+    valid = {
+        "product_name": "Hibiscus Oil", "category": "Hair Care", "brand": "Garden",
+        "product_details": "Oil", "cost_price": 70, "stock_quantity": 0,
+        "minimum_profit_margin": 0,
+    }
+    assert ProductCreateRequest.model_validate(valid).cost_price == 70
+    for field, value in (("cost_price", 0), ("cost_price", -1),
+                         ("stock_quantity", -1), ("minimum_profit_margin", -1)):
+        with pytest.raises(ValueError):
+            ProductCreateRequest.model_validate({**valid, field: value})
+
+
+def test_minimum_price_rejects_zero_cost_and_negative_margin():
+    with pytest.raises(ValueError, match="Cost price"):
+        minimum_viable_selling_price(0, 20)
+    with pytest.raises(ValueError, match="margin"):
+        minimum_viable_selling_price(100, -1)
 
 
 def test_quantity_comparable_market_range_and_margin_reasoning(monkeypatch):

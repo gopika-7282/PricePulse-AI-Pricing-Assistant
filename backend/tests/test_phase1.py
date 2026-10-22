@@ -373,18 +373,29 @@ class TestScrapingService:
         ]
 
         with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
-            MockScraper.return_value.get_competitor_data = AsyncMock(return_value=fake_results)
+            MockScraper.return_value.get_competitor_data = MagicMock(return_value=fake_results)
             scrape_product(db, cat)
 
-        # At this point competitor data is committed. Simulate recommendation failure separately.
-        from app.services.product_service import create_retailer_product
-        with patch("app.services.scraping_service.ScoutScraper") as MockScraper, \
-             patch("app.services.product_service.calculate_price_analysis",
-                   side_effect=Exception("Analysis boom")):
-            MockScraper.return_value.get_competitor_data = AsyncMock(return_value=[])
-            # The actual competitor data already committed should still be present
-            count = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).count()
-            assert count == 1, "Competitor data must survive even if recommendation would fail"
+        # The scraper is a separate persistence boundary from LangGraph's
+        # Strategist. Fail during its real pricing calculation after scraping
+        # has committed the competitor row.
+        from app.services.pricing_workflow import strategist_node
+        retailer_product = RetailerProduct(
+            user_id=1, catalog_product_id=cat.id, cost_price=50.0,
+            stock_quantity=2, minimum_profit_margin=20.0,
+        )
+        db.add(retailer_product)
+        db.flush()
+        competitors = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).all()
+        with patch("app.services.pricing_service.minimum_viable_selling_price",
+                   side_effect=RuntimeError("Recommendation boom")):
+            with pytest.raises(RuntimeError, match="Recommendation boom"):
+                strategist_node({
+                    "db": db, "retailer_product_id": retailer_product.id,
+                    "competitors": competitors, "evidence_type": "LIVE",
+                })
+        count = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).count()
+        assert count == 1, "Competitor data must survive downstream recommendation failure"
 
     # T15 — Rating extracted correctly (valid 0-5)
     def test_rating_extracted_valid(self, db):
