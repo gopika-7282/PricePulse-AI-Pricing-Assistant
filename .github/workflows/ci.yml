@@ -67,7 +67,7 @@ jobs:
     env:
       DATABASE_URL: postgresql+psycopg2://pricepulse_test:pricepulse_test@localhost:5432/pricepulse_test
       SECRET_KEY: ci-only-secret-key-not-for-deployment
-      CHROMA_PERSIST_DIRECTORY: ${{ runner.temp }}/pricepulse-chroma-${{ github.run_id }}
+      CHROMA_PERSIST_DIRECTORY: ${{ github.workspace }}/.ci-temp/pricepulse-chroma-${{ github.run_id }}
       OLLAMA_BASE_URL: http://127.0.0.1:9
       OLLAMA_TIMEOUT: '1'
       OLLAMA_IDENTITY_TIMEOUT: '1'
