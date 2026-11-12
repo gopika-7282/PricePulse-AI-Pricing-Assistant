@@ -10,7 +10,8 @@ from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from fastapi.exception_handlers import request_validation_exception_handler
 from app.utils.auth_validation import auth_validation_error_payload
-
+# Create database tables if they do not exist
+Base.metadata.create_all(bind=engine)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
