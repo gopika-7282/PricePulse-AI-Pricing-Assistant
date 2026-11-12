@@ -760,7 +760,9 @@ class TestScraperDynamics:
         # Product 4 has no rating
         assert products[3]["rating"] is None
 
-        # Validator also keeps it None
+        # Static HTML parsing has no observation clock; supply the explicit
+        # timestamp captured by a scraper boundary before validation.
+        products[3]["scraped_at"] = "2026-11-12T10:00:00+00:00"
         validated = validate_product(products[3])
         assert validated["rating"] is None
 

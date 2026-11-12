@@ -60,6 +60,18 @@ class ScrapedProductSchema(BaseModel):
             raise ValueError(f"Invalid URL protocol: '{v[:30]}'")
         return v
 
+    @field_validator("scraped_at")
+    @classmethod
+    def validate_observation_timestamp(cls, value: str) -> str:
+        """Require an explicit, parseable, timezone-aware observation time."""
+        try:
+            observed_at = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise ValueError("scraped_at must be an ISO-8601 timestamp") from exc
+        if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+            raise ValueError("scraped_at must include a timezone")
+        return value
+
     @field_validator("rating")
     @classmethod
     def validate_rating(cls, v: Optional[float]) -> Optional[float]:

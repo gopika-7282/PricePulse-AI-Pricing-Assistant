@@ -106,6 +106,26 @@ def make_competitor(db, catalog_id, platform="Flipkart", name="Test", price=100.
     return c
 
 
+def make_async_scout_scraper(products):
+    """Model ScoutScraper's async status API and spy on its awaited call."""
+    status_result = {
+        "products": products,
+        "platform_statuses": {"Flipkart": "OK"},
+        "blocked_platforms": [],
+        "failed_platforms": [],
+    }
+    status_call = AsyncMock(return_value=status_result)
+
+    class AsyncScoutScraper:
+        async def get_competitor_data(self, **kwargs):
+            raise AssertionError("The service should use get_platform_statuses")
+
+        async def get_platform_statuses(self, **kwargs):
+            return await status_call(**kwargs)
+
+    return AsyncScoutScraper(), status_call
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # PART A — Semantic Normalization
 # ═══════════════════════════════════════════════════════════════════════════
@@ -325,6 +345,71 @@ class TestScrapingService:
         assert cat.last_scraped_at is None, "scraped_at must not be set on scraper failure"
         assert cat.scraping_status == "FAILED"
 
+    def test_missing_observation_timestamp_is_rejected_and_not_persisted(self, db):
+        from scraping.validator import validate_scraped_product
+
+        raw = {
+            "platform_name": "Flipkart", "product_name": "Untimed Soap",
+            "price": 45.0, "product_url": "https://flipkart.com/p/untimed",
+            "rating": None, "availability": True,
+        }
+        assert validate_scraped_product(raw) is None
+        for untrusted_timestamp in ("not-a-timestamp", "2026-11-12T10:00:00"):
+            assert validate_scraped_product({**raw, "scraped_at": untrusted_timestamp}) is None
+
+        cat = make_catalog(db, "Untimed Soap")
+        with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
+            scraper, status_call = make_async_scout_scraper([raw])
+            MockScraper.return_value = scraper
+            scrape_product(db, cat)
+            status_call.assert_awaited_once()
+
+        assert db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).count() == 0
+        assert db.query(CompetitorPriceHistory).count() == 0
+
+    def test_async_scraper_result_is_awaited_and_timestamp_preserved(self, db):
+        observed_at = "2026-11-11T08:15:30+00:00"
+        from scraping.validator import validate_scraped_product
+
+        raw = {
+            "platform_name": "Flipkart", "product_name": "Timed Soap",
+            "price": 45.0, "product_url": "https://flipkart.com/p/timed",
+            "rating": None, "availability": True, "scraped_at": observed_at,
+        }
+        validated = validate_scraped_product(raw)
+        assert validated["scraped_at"] == observed_at
+
+        cat = make_catalog(db, "Timed Soap")
+        with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
+            scraper, status_call = make_async_scout_scraper([raw])
+            MockScraper.return_value = scraper
+            scrape_product(db, cat)
+            status_call.assert_awaited_once()
+
+        competitor = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).one()
+        history = db.query(CompetitorPriceHistory).filter_by(competitor_product_id=competitor.id).one()
+        expected_at = datetime.fromisoformat(observed_at).replace(tzinfo=None)
+        # SQLite drops timezone metadata; the persisted UTC wall time must match.
+        assert competitor.scraped_at == expected_at
+        assert history.scraped_at == expected_at
+
+    def test_async_scraper_missing_rating_remains_none(self, db):
+        cat = make_catalog(db, "Unrated Soap")
+        result = [{
+            "platform_name": "Flipkart", "product_name": "Unrated Soap",
+            "price": 52.0, "product_url": "https://flipkart.com/p/unrated",
+            "rating": None, "availability": True,
+            "scraped_at": "2026-11-12T10:00:00+00:00",
+        }]
+        with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
+            scraper, status_call = make_async_scout_scraper(result)
+            MockScraper.return_value = scraper
+            scrape_product(db, cat)
+            status_call.assert_awaited_once()
+
+        competitor = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).one()
+        assert competitor.rating is None
+
     # T17 — Multiple Flipkart products returned
     def test_multiple_flipkart_products_stored(self, db):
         cat = make_catalog(db, "Multi Soap")
@@ -338,6 +423,7 @@ class TestScrapingService:
                 "product_details": ["200ml"],
                 "rating": 4.1,
                 "availability": True,
+                "scraped_at": "2026-11-12T10:00:00+00:00",
             },
             {
                 "platform_name": "Flipkart",
@@ -347,15 +433,20 @@ class TestScrapingService:
                 "product_details": ["100ml"],
                 "rating": 3.8,
                 "availability": True,
+                "scraped_at": "2026-11-12T10:00:00+00:00",
             },
         ]
 
         with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
-            MockScraper.return_value.get_competitor_data = AsyncMock(return_value=fake_results)
+            scraper, status_call = make_async_scout_scraper(fake_results)
+            MockScraper.return_value = scraper
             scrape_product(db, cat)
+            status_call.assert_awaited_once()
 
-        count = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).count()
-        assert count == 2, f"Expected 2 competitor rows, got {count}"
+        competitors = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).order_by(CompetitorProduct.product_name).all()
+        assert len(competitors) == 2
+        assert [item.rating for item in competitors] == [4.1, 3.8]
+        assert db.query(CompetitorPriceHistory).count() == 2
 
     # T13 — DB persistence failure rolls back, no competitor rows left
     def test_db_persist_failure_rolls_back(self, db):
@@ -370,14 +461,17 @@ class TestScrapingService:
                 "product_details": [],
                 "rating": None,
                 "availability": True,
+                "scraped_at": "2026-11-12T10:00:00+00:00",
             }
         ]
 
         with patch("app.services.scraping_service.ScoutScraper") as MockScraper, \
              patch("app.services.scraping_service.upsert_competitor_product",
                    side_effect=Exception("DB constraint error")):
-            MockScraper.return_value.get_competitor_data = AsyncMock(return_value=fake_results)
+            scraper, status_call = make_async_scout_scraper(fake_results)
+            MockScraper.return_value = scraper
             scrape_product(db, cat)
+            status_call.assert_awaited_once()
 
         count = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).count()
         assert count == 0, "On DB failure, no competitor rows should be persisted"
@@ -399,12 +493,15 @@ class TestScrapingService:
                 "product_details": ["Net 200ml"],
                 "rating": 4.0,
                 "availability": True,
+                "scraped_at": "2026-11-12T10:00:00+00:00",
             }
         ]
 
         with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
-            MockScraper.return_value.get_competitor_data = MagicMock(return_value=fake_results)
+            scraper, status_call = make_async_scout_scraper(fake_results)
+            MockScraper.return_value = scraper
             scrape_product(db, cat)
+            status_call.assert_awaited_once()
 
         # The scraper is a separate persistence boundary from LangGraph's
         # Strategist. Fail during its real pricing calculation after scraping
@@ -440,12 +537,15 @@ class TestScrapingService:
                 "product_details": [],
                 "rating": 4.3,
                 "availability": True,
+                "scraped_at": "2026-11-12T10:00:00+00:00",
             }
         ]
 
         with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
-            MockScraper.return_value.get_competitor_data = AsyncMock(return_value=fake_results)
+            scraper, status_call = make_async_scout_scraper(fake_results)
+            MockScraper.return_value = scraper
             scrape_product(db, cat)
+            status_call.assert_awaited_once()
 
         comp = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).first()
         assert comp is not None
@@ -463,16 +563,19 @@ class TestScrapingService:
                 "product_details": [],
                 "rating": 7.5,  # Invalid — > 5; scraper should have set to None before calling service
                 "availability": True,
+                "scraped_at": "2026-11-12T10:00:00+00:00",
             }
         ]
 
         with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
-            MockScraper.return_value.get_competitor_data = AsyncMock(return_value=fake_results)
+            scraper, status_call = make_async_scout_scraper(fake_results)
+            MockScraper.return_value = scraper
             scrape_product(db, cat)
+            status_call.assert_awaited_once()
 
         comp = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).first()
-        # The scraping service stores whatever the scraper returns; rating validation is in the scraper
         assert comp is not None
+        assert comp.rating is None
 
     # T16 — Product details extracted and stored as JSON
     def test_product_details_extracted(self, db):
@@ -488,12 +591,15 @@ class TestScrapingService:
                 "product_details": details_list,
                 "rating": 4.0,
                 "availability": True,
+                "scraped_at": "2026-11-12T10:00:00+00:00",
             }
         ]
 
         with patch("app.services.scraping_service.ScoutScraper") as MockScraper:
-            MockScraper.return_value.get_competitor_data = AsyncMock(return_value=fake_results)
+            scraper, status_call = make_async_scout_scraper(fake_results)
+            MockScraper.return_value = scraper
             scrape_product(db, cat)
+            status_call.assert_awaited_once()
 
         comp = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).first()
         assert comp is not None
