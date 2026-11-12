@@ -1,12 +1,10 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
-import { call, clearSession, createChatConversation, loadChatConversation, loadAuthenticatedUser, loadRetailerProducts, saveRetailerProduct, streamPricingWorkflow, acceptRecommendation, sendChatMessage } from './api.js';
+import { API_BASE_URL, call, clearSession, createChatConversation, loadChatConversation, loadAuthenticatedUser, loadRetailerProducts, saveRetailerProduct, streamPricingWorkflow, acceptRecommendation, sendChatMessage } from './api.js';
 import { toggleProductList } from './productListState.js';
 import { appendChatMessage, clearChatSession, getActiveChatConversation, getChatConversation, rememberChatConversation, restoreChatMessages } from './chatState.js';
 import { createEmptyForgotPasswordState, createEmptyLoginCredentials, createEmptyResetPasswordState, createSubmissionLock, forgotPasswordNotice, INVALID_RESET_LINK_MESSAGE, passwordResetErrorMessage, readResetToken, submitPasswordReset } from './authState.js';
 import './styles.css';
-
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 function PricePulseAssistantMark({ size = 32 }) {
   return <svg className="assistant-mark" width={size} height={size} viewBox="0 0 40 40" role="img" aria-label="PricePulse Assistant">
@@ -62,7 +60,7 @@ function Auth({ onLogin }) {
       }
       if (screen === 'register') await call('/auth/register', { method: 'POST', body: JSON.stringify({ retailer_name: form.get('name'), email: form.get('email'), business_name: form.get('business') || null, password: form.get('password') }) });
       const body = new URLSearchParams({ username: form.get('email'), password: form.get('password') });
-      const response = await fetch(`${API}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
+      const response = await fetch(`${API_BASE_URL}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body });
       const data = await response.json(); if (!response.ok) throw new Error(data.detail || 'Sign in failed. Check your email and password.'); onLogin(data.access_token);
     } catch (err) { if (screen === 'login') { element.reset(); setCredentials(createEmptyLoginCredentials()); } setError(screen === 'reset' ? passwordResetErrorMessage(err) : err.message); } finally { submissionLock.current.release(); setBusy(false); }
   }

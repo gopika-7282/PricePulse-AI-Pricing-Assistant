@@ -1,4 +1,4 @@
-const API = import.meta.env?.VITE_API_URL || 'http://localhost:8000';
+export const API_BASE_URL = import.meta.env?.VITE_API_URL || (import.meta.env?.PROD ? '' : 'http://localhost:8000');
 const SERVER_UNAVAILABLE = 'Unable to connect to the PricePulse server. Please try again in a moment.';
 const SERVER_ERROR = 'Something went wrong on the PricePulse server. Please try again later.';
 
@@ -46,7 +46,7 @@ export async function call(path, { token, onUnauthorized, ...options } = {}) {
   let response;
   try {
     const timeout = path.includes('/analyze') ? 240000 : path === '/api/chat' ? 360000 : 30000;
-    response = await fetch(`${API}${path}`, { ...options, signal: options.signal || AbortSignal.timeout(timeout), headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options?.headers } });
+    response = await fetch(`${API_BASE_URL}${path}`, { ...options, signal: options.signal || AbortSignal.timeout(timeout), headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...options?.headers } });
   } catch (error) {
     throw connectionError(error, path, path.includes('/analyze'));
   }
@@ -79,7 +79,7 @@ export function saveRetailerProduct(token, product, existingProduct, onUnauthori
 export async function streamPricingWorkflow(retailerProductId, token, onProgress, onUnauthorized) {
   let response;
   try {
-    response = await fetch(`${API}/api/workflow/${retailerProductId}/analyze/stream`, {
+    response = await fetch(`${API_BASE_URL}/api/workflow/${retailerProductId}/analyze/stream`, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, Accept: 'text/event-stream' },
       // A full workflow can include multiple bounded model calls and marketplace checks.
