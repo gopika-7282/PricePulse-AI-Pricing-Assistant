@@ -1,0 +1,5 @@
+Independent Alembic graph and canonical_alembic_version table for clean
+PostgreSQL installations. The legacy backend/alembic graph and its
+alembic_version table remain unchanged. Use scripts/db_preflight.py before
+any adoption of an existing database; do not stamp an existing schema unless
+the preflight explicitly reports it safe.

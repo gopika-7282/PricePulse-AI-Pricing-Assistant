@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import math
 import json
 import asyncio
 import logging
@@ -23,7 +24,9 @@ from app.services.llm_service import generate_structured
 from app.config import OLLAMA_TIMEOUT
 from app.services.pricing_workflow import analyze_retailer_product
 from app.services.market_analysis_service import build_market_evidence, classify_market_question
-from app.utils.quantity import normalize_quantity, price_at_target_pack
+from app.utils.quantity import normalize_quantity, price_at_target_pack, listing_quantity_is_uncertain, listing_quantity_reason
+from app.utils.quantity import strip_quantity_marker
+from app.services.relevance_filter_service import get_match_quality, strip_match_marker
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -35,24 +38,41 @@ def _business_reasoning(db: Session, product, recommendation, competitors):
     """Return concise margin and compatible-market explanations for the retailer."""
     points = []
     evidence = recommendation.evidence_type
-    usable_competitors = competitors if evidence in {"LIVE", "STALE_FALLBACK"} else []
-    compared = []
-    raw_without_quantity = []
+    usable_competitors = competitors if evidence in {"LIVE", "STALE_FALLBACK", "PROVISIONAL"} else []
     target = normalize_quantity(product.quantity_value, product.quantity_unit) if product.quantity_value and product.quantity_unit else None
+    from app.services.market_statistics import calculate_market_statistics
+    from app.services.relevance_filter_service import classify_candidate
+    from app.utils.quantity import strip_quantity_marker
+
+    compared = []
     if target:
         for competitor in usable_competitors:
-            equivalent_price = price_at_target_pack(float(competitor.price), product.quantity_value, product.quantity_unit,
+            if listing_quantity_is_uncertain(competitor):
+                continue
+            quality, _ = classify_candidate(
+                product.product_name, competitor.product_name or "", product.product_details or "",
+                strip_match_marker(strip_quantity_marker(competitor.product_details)) or "",
+            )
+            if quality not in {"exact", "alternative"}:
+                continue
+            try:
+                price = float(competitor.price)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(price) or price <= 0:
+                continue
+            equivalent_price = price_at_target_pack(
+                price, product.quantity_value, product.quantity_unit,
                 competitor.quantity_value, competitor.quantity_unit, competitor.pack_count,
-                competitor.total_quantity, competitor.total_quantity_unit)
-            if equivalent_price is not None:
+                competitor.total_quantity, competitor.total_quantity_unit,
+            )
+            if equivalent_price is not None and math.isfinite(equivalent_price) and equivalent_price > 0:
                 compared.append((competitor, equivalent_price))
-            elif not (competitor.total_quantity or competitor.quantity_value) or not (competitor.total_quantity_unit or competitor.quantity_unit):
-                raw_without_quantity.append(competitor)
-        prices = [equivalent for _, equivalent in compared]
-    else:
-        compared = [(competitor, float(competitor.price)) for competitor in usable_competitors
-                    if competitor.price and float(competitor.price) > 0]
-        prices = [price for _, price in compared]
+    market_stats = calculate_market_statistics([
+        {"marketplace": competitor.platform_name, "price": price}
+        for competitor, price in compared
+    ])
+    prices = [price for _, price in compared]
 
     from app.services.pricing_service import minimum_viable_selling_price
     floor = minimum_viable_selling_price(product.cost_price, product.minimum_profit_margin)
@@ -61,23 +81,31 @@ def _business_reasoning(db: Session, product, recommendation, competitors):
     actual_margin = (rec_price - cost) / cost * 100 if cost > 0 else 0.0
     margin_headroom = actual_margin - float(product.minimum_profit_margin or 0)
     points.append(
-        f"At ₹{rec_price:,.2f}, each pack earns ₹{rec_price - cost:,.2f} gross profit ({actual_margin:.1f}% margin on cost), "
-        f"above the ₹{floor:,.2f} minimum profitable price (floor) by ₹{rec_price - floor:,.2f} and {margin_headroom:.1f} margin points."
+        f"At ₹{rec_price:,.2f}, each pack earns ₹{rec_price - cost:,.2f} gross profit; markup on cost is {actual_margin:.1f}% "
+        f"and gross margin on selling price is {(rec_price - cost) / rec_price * 100 if rec_price else 0:.1f}%. "
+        f"This is above the ₹{floor:,.2f} minimum profitable selling price."
     )
-    if target:
-        points.append(f"Comparisons are normalized to your {float(product.quantity_value):g} {product.quantity_unit} pack.")
     if prices:
-        low, high = min(prices), max(prices)
+        low = market_stats["typical_price_range_low"]
+        high = market_stats["typical_price_range_high"]
+        reference = market_stats["median_price"]
         if rec_price < low:
             position = "below"
         elif rec_price > high:
             position = "above"
-        elif abs(low - high) < 0.01:
-            position = "aligned with"
+        elif abs(rec_price - reference) <= 0.01:
+            position = "at the median reference"
         else:
             position = "within"
-        basis = f"per {float(product.quantity_value):g} {product.quantity_unit}" if target else "at listed pack sizes"
-        points.append(f"Comparable listings ({len(prices)} compatible) range from ₹{low:,.2f}–₹{high:,.2f} {basis}; your price is {position} that range.")
+        points.append(
+            f"{len(prices)} validated comparable offer(s) across {market_stats['distinct_marketplace_count']} marketplace(s) "
+            f"have a median reference of ₹{reference:,.2f}, typical range ₹{low:,.2f}–₹{high:,.2f}, and observed range "
+            f"₹{market_stats['observed_minimum_price']:,.2f}–₹{market_stats['observed_maximum_price']:,.2f}; your price is {position}."
+        )
+        if evidence == "PROVISIONAL" and len(points) < 4:
+            points.append("Market evidence is sparse; treat this reference as provisional and low confidence.")
+        elif evidence == "STALE_FALLBACK" and len(points) < 4:
+            points.append("Live marketplace data was unavailable; stored observations may be out of date.")
         rated = [(c, equivalent) for c, equivalent in compared if c.rating is not None and c.price and float(c.price) > 0]
         near = [(c, equivalent) for c, equivalent in rated if abs(equivalent - rec_price) <= max(20, rec_price * .15)]
         if near:
@@ -107,11 +135,13 @@ def _business_reasoning(db: Session, product, recommendation, competitors):
                 points.append("Similar products have generally moved down in price recently.")
             else:
                 points.append("Similar products have stayed at broadly similar prices recently.")
-    elif evidence == "LLM_ESTIMATE":
+    elif evidence in {"LLM_ESTIMATE", "COST_ESTIMATE"}:
         pack = f" {product.quantity_value:g} {product.quantity_unit}" if product.quantity_value and product.quantity_unit else ""
-        points.append(f"This is an estimate, not a market-data recommendation; it uses your{pack} {product.category or 'product'}, supplied details, and cost of ₹{product.cost_price:,.2f}.")
-    if raw_without_quantity and len(points) < 4:
-        points.append(f"{len(raw_without_quantity)} listing(s) had no stated quantity; their raw prices were excluded from equivalent-pack comparisons.")
+        points.append(f"This is a cost-based estimate, not a verified market price; it uses your{pack} {product.category or 'product'} and cost of ₹{product.cost_price:,.2f}.")
+    elif evidence == "PROVISIONAL" and len(points) < 4:
+        points.append("Market evidence is sparse; treat this reference as provisional and low confidence.")
+    elif evidence == "STALE_FALLBACK" and len(points) < 4:
+        points.append("Live marketplace data was unavailable; stored observations may be out of date.")
     if len(points) < 4 and product.stock_quantity is not None:
         points.append(f"Your inventory is {int(product.stock_quantity)} pack(s); sales velocity was unavailable to infer demand.")
     return points[:4]
@@ -259,17 +289,21 @@ def _analysis_response(db: Session, owned: RetailerProduct, result: dict):
     competitors = result.get("competitors", [])
     marketplace_products = {name: [] for name in ("Amazon", "Flipkart", "Myntra", "Meesho")}
     for item in competitors:
+        quantity_uncertain = listing_quantity_is_uncertain(item)
         equivalent_price = None
         if owned.quantity_value and owned.quantity_unit:
             equivalent_price = price_at_target_pack(
                 float(item.price), owned.quantity_value, owned.quantity_unit,
                 item.quantity_value, item.quantity_unit, item.pack_count,
                 item.total_quantity, item.total_quantity_unit,
+                quantity_uncertain=quantity_uncertain,
             )
         quantity_text = (
-            f"{float(item.total_quantity):g} {item.total_quantity_unit}"
+            "Quantity uncertain" if quantity_uncertain else
+            (f"{float(item.total_quantity):g} {item.total_quantity_unit}"
             if item.total_quantity and item.total_quantity_unit else
             (f"{float(item.quantity_value):g} {item.quantity_unit}" if item.quantity_value and item.quantity_unit else "Not specified")
+            )
         )
         marketplace_products.setdefault(item.platform_name, []).append({
             "product_name": item.product_name,
@@ -277,7 +311,10 @@ def _analysis_response(db: Session, owned: RetailerProduct, result: dict):
             "rating": item.rating,
             "rating_display": f"{float(item.rating):.1f}" if item.rating is not None else "Not rated",
             "product_url": item.product_url,
-            "product_details": item.product_details,
+            "product_details": strip_match_marker(strip_quantity_marker(item.product_details)),
+            "match_quality": get_match_quality(item.product_details),
+            "quantity_status": "uncertain" if quantity_uncertain else ("known" if item.total_quantity or item.quantity_value else "unknown"),
+            "quantity_reason": listing_quantity_reason(item),
             "quantity_value": item.quantity_value,
             "quantity_unit": item.quantity_unit,
             "quantity_display": quantity_text,
@@ -286,20 +323,77 @@ def _analysis_response(db: Session, owned: RetailerProduct, result: dict):
             "total_quantity_unit": item.total_quantity_unit,
             "equivalent_price": round(equivalent_price, 2) if equivalent_price is not None else None,
             "equivalent_price_display": (f"₹{equivalent_price:,.2f} per {float(owned.quantity_value):g} {owned.quantity_unit}"
-                                         if equivalent_price is not None else "Not available"),
+                                         if equivalent_price is not None else
+                                         "Not normalized — quantity uncertain" if quantity_uncertain else "Not available"),
             "availability_display": "Not reported" if item.availability is None else ("In stock" if item.availability else "Out of stock"),
-            "product_details_display": item.product_details or "Not available",
+            "product_details_display": strip_match_marker(strip_quantity_marker(item.product_details)) or "Not available",
         })
     strategy = result.get("strategy") or {}
     from app.services.pricing_service import minimum_viable_selling_price
-    minimum_price = minimum_viable_selling_price(owned.cost_price, owned.minimum_profit_margin)
-    market_low = strategy.get("market_price_range_low")
-    market_high = strategy.get("market_price_range_high")
-    market_range_display = (f"₹{market_low:,.2f}–₹{market_high:,.2f} per {float(owned.quantity_value):g} {owned.quantity_unit}"
-                            if market_low is not None and market_high is not None and owned.quantity_value and owned.quantity_unit
-                            else "Not available")
+    minimum_price = strategy.get("minimum_viable_price", minimum_viable_selling_price(owned.cost_price, owned.minimum_profit_margin))
+    market_stats = strategy.get("market_statistics") or {}
+    market_low = market_stats.get("typical_price_range_low")
+    market_high = market_stats.get("typical_price_range_high")
+    pack_label = f" per {float(owned.quantity_value):g} {owned.quantity_unit}" if owned.quantity_value and owned.quantity_unit else ""
+    market_range_display = (f"₹{market_low:,.2f}–₹{market_high:,.2f}{pack_label} (typical range)"
+                            if market_low is not None and market_high is not None else "Not available")
+    observed_low, observed_high = market_stats.get("observed_minimum_price"), market_stats.get("observed_maximum_price")
+    observed_range_display = (f"₹{observed_low:,.2f}–₹{observed_high:,.2f}{pack_label} (observed min–max)"
+                              if observed_low is not None and observed_high is not None else "Not available")
+    recommendation_payload = None
+    if recommendation:
+        final_price = float(recommendation.recommended_price)
+        cost = float(owned.cost_price)
+        gross_profit = final_price - cost
+        markup = gross_profit / cost * 100 if cost else 0.0
+        gross_margin = gross_profit / final_price * 100 if final_price else 0.0
+        reference = strategy.get("market_reference_price")
+        recommendation_payload = {
+            "id": recommendation.id, "recommended_price": recommendation.recommended_price,
+            "expected_profit": recommendation.expected_profit, "profit_percentage": recommendation.profit_percentage,
+            "reasoning_summary": recommendation.reasoning,
+            "reasoning": ([recommendation.reasoning] if recommendation.reasoning and market_stats
+                          else _business_reasoning(db, owned, recommendation, competitors)),
+            "confidence": recommendation.confidence_score,
+            "confidence_label": strategy.get("confidence_label", "Low"),
+            "evidence_type": recommendation.evidence_type,
+            "pricing_method": strategy.get("pricing_method", "market_data_backed" if recommendation.evidence_type in {"LIVE", "STALE_FALLBACK"} else "local_ai_estimate"),
+            "local_ai_estimate": strategy.get("local_ai_estimate"),
+            "basis": "MARKET_DATA" if recommendation.evidence_type in {"LIVE", "STALE_FALLBACK"} else "ESTIMATE",
+            "retailer_quantity_display": pack_label.strip() or "Not specified",
+            "cost_price": owned.cost_price,
+            "minimum_profit_margin": owned.minimum_profit_margin,
+            "minimum_markup_percent": round(float(owned.minimum_profit_margin), 2),
+            "minimum_viable_price": minimum_price,
+            "minimum_profitable_selling_price": minimum_price,
+            "gross_profit_per_unit": round(gross_profit, 2),
+            "gross_profit_per_pack": round(gross_profit, 2),
+            "markup_on_cost_percent": round(markup, 2),
+            "gross_margin_percent": round(gross_margin, 2),
+            # profit_percentage is a legacy field whose stored semantics are markup on cost.
+            "actual_margin_percent": round(gross_margin, 2),
+            "margin_headroom_percent": round(markup - float(owned.minimum_profit_margin), 2),
+            "market_reference_price": reference,
+            "market_price_range_display": market_range_display,
+            "observed_market_range_display": observed_range_display,
+            "market_position": strategy.get("market_position"),
+            "comparable_offer_count": market_stats.get("comparable_offer_count", 0),
+            "distinct_marketplace_count": market_stats.get("distinct_marketplace_count", 0),
+            "outlier_count": market_stats.get("outlier_count", 0),
+            "exclusion_count": market_stats.get("exclusion_count", 0),
+            "exclusion_reasons": market_stats.get("exclusion_reasons", {}),
+            "accepted_by_user": recommendation.accepted_by_user,
+            "price_range_low": strategy.get("price_range_low"),
+            "price_range_high": strategy.get("price_range_high"),
+            "recommended_price_min": recommendation.recommended_price_min,
+            "recommended_price_max": recommendation.recommended_price_max,
+        }
     return {
         "evidence_type": result.get("evidence_type", "NO_EVIDENCE"),
+        "pricing_method": (result.get("strategy") or {}).get("pricing_method", "estimate_unavailable"),
+        "estimation_status": (result.get("strategy") or {}).get("estimation_status", "unavailable"),
+        "minimum_viable_price": (result.get("strategy") or {}).get("minimum_viable_price", minimum_viable_selling_price(owned.cost_price, owned.minimum_profit_margin)),
+        "local_ai_estimate": (result.get("strategy") or {}).get("local_ai_estimate"),
         "freshness_status": result.get("freshness_status", "NO_EVIDENCE"),
         "marketplace_statuses": result.get("marketplace_statuses", {}),
         "marketplace_products": marketplace_products,
@@ -307,24 +401,8 @@ def _analysis_response(db: Session, owned: RetailerProduct, result: dict):
         "error": result.get("identity_error") or result.get("error"),
         "warnings": (result.get("strategy") or {}).get("warnings", result.get("warnings", [])),
         "competitor_summary": (result.get("strategy") or {}).get("competitor_summary"),
-        "recommendation": ({"id": recommendation.id, "recommended_price": recommendation.recommended_price,
-            "expected_profit": recommendation.expected_profit, "profit_percentage": recommendation.profit_percentage,
-            "reasoning_summary": recommendation.reasoning, "reasoning": _business_reasoning(db, owned, recommendation, competitors), "confidence": recommendation.confidence_score,
-            "evidence_type": recommendation.evidence_type,
-            "basis": "MARKET_DATA" if recommendation.evidence_type in {"LIVE", "STALE_FALLBACK"} else "ESTIMATE",
-            "retailer_quantity_display": (f"{float(owned.quantity_value):g} {owned.quantity_unit}" if owned.quantity_value and owned.quantity_unit else "Not specified"),
-            "cost_price": owned.cost_price,
-            "minimum_profit_margin": owned.minimum_profit_margin,
-            "minimum_viable_price": minimum_price,
-            "actual_margin_percent": recommendation.profit_percentage,
-            "margin_headroom_percent": recommendation.profit_percentage - owned.minimum_profit_margin,
-            "market_price_range_display": market_range_display,
-            "accepted_by_user": recommendation.accepted_by_user,
-            "price_range_low": (result.get("strategy") or {}).get("price_range_low"),
-            "price_range_high": (result.get("strategy") or {}).get("price_range_high"),
-            "recommended_price_min": recommendation.recommended_price_min,
-            "recommended_price_max": recommendation.recommended_price_max}
-            if recommendation else None),
+        "market_statistics": market_stats,
+        "recommendation": recommendation_payload,
     }
 
 
@@ -497,16 +575,19 @@ def chat(request: ChatRequest, db: Session = Depends(get_db), current_user: User
         competitor_rows = db.query(CompetitorProduct).filter_by(catalog_product_id=product.catalog_product_id).all()
         competitor_lines = []
         for item in competitor_rows:
-            quantity_label = f"{item.quantity_value:g} {item.quantity_unit}" if item.quantity_value and item.quantity_unit else "quantity not recorded"
+            quantity_uncertain = listing_quantity_is_uncertain(item)
+            quantity_label = ("quantity uncertain" if quantity_uncertain else
+                              f"{item.quantity_value:g} {item.quantity_unit}" if item.quantity_value and item.quantity_unit else "quantity not recorded")
             observed_value = item.total_quantity if item.total_quantity is not None else item.quantity_value
             observed_unit = item.total_quantity_unit or item.quantity_unit
             if item.total_quantity is None and observed_value is not None:
                 observed_value *= item.pack_count or 1
-            normalized = normalize_quantity(observed_value, observed_unit) if observed_value and observed_unit else None
+            normalized = normalize_quantity(observed_value, observed_unit) if not quantity_uncertain and observed_value and observed_unit else None
             unit_label = (f"; unit price ₹{float(item.price) / normalized[0]:,.4f} per {'g' if normalized[1] == 'mass' else 'ml'}"
                           if normalized and normalized[0] > 0 else "")
             equivalent = price_at_target_pack(float(item.price), product.quantity_value, product.quantity_unit,
-                item.quantity_value, item.quantity_unit, item.pack_count, item.total_quantity, item.total_quantity_unit) \
+                item.quantity_value, item.quantity_unit, item.pack_count, item.total_quantity, item.total_quantity_unit,
+                quantity_uncertain=quantity_uncertain) \
                 if product.quantity_value and product.quantity_unit else None
             equivalent_label = f"; target-pack equivalent ₹{equivalent:,.2f}" if equivalent is not None else ""
             competitor_lines.append(

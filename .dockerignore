@@ -1,0 +1,17 @@
+.git/
+venv/
+.venv/
+**/node_modules/
+**/dist/
+**/.env
+**/.env.*
+!**/.env.example
+**/__pycache__/
+**/*.py[cod]
+**/.pytest_cache/
+backend/tests/
+chroma_db/
+chroma_data/
+uploads/
+*.log
+test-results/

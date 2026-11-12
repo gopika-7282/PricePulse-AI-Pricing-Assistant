@@ -14,6 +14,7 @@ def candidate(idx, title=None, asin=None, price=125.0):
         "ranking": idx,
         "rating": None,
         "availability": None,
+        "scraped_at": "2026-01-01T00:00:00+00:00",
         "product_details": [],
     }
 

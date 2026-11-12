@@ -1,4 +1,4 @@
-from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import Column, DateTime, ForeignKey, Integer, String, Text, Sequence
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 
@@ -8,7 +8,7 @@ from app.database import Base
 class ChatConversation(Base):
     __tablename__ = "chat_conversations"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, Sequence("chat_conversations_id_seq"), primary_key=True)
     retailer_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     product_id = Column(Integer, ForeignKey("retailer_products.id", ondelete="SET NULL"), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
@@ -19,7 +19,7 @@ class ChatConversation(Base):
 class ChatMessage(Base):
     __tablename__ = "chat_messages"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, Sequence("chat_messages_id_seq"), primary_key=True)
     conversation_id = Column(Integer, ForeignKey("chat_conversations.id", ondelete="CASCADE"), nullable=False, index=True)
     role = Column(String(16), nullable=False)
     content = Column(Text, nullable=False)

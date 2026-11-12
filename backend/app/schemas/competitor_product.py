@@ -1,6 +1,7 @@
 from pydantic import BaseModel, ConfigDict
 from typing import Optional
 from datetime import datetime
+from pydantic import field_validator
 
 class CompetitorProductCreate(BaseModel):
     catalog_product_id: int
@@ -10,8 +11,7 @@ class CompetitorProductCreate(BaseModel):
     product_details: Optional[str] = None
     price: float
     rating: Optional[float] = None
-    availability: bool = True
-
+    availability: Optional[bool] = None
 class CompetitorProductResponse(BaseModel):
     id: int
     catalog_product_id: int
@@ -19,7 +19,8 @@ class CompetitorProductResponse(BaseModel):
     product_name: str
     price: float
     rating: Optional[float] = None
-    availability: bool
-    scraped_at: datetime
+    availability: Optional[bool] = None
+    scraped_at: Optional[datetime] = None
+    observation_source: str
 
     model_config = ConfigDict(from_attributes=True)

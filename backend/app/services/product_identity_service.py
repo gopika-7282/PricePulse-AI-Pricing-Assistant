@@ -44,11 +44,18 @@ STOP_WORDS: Set[str] = {
     "natural", "organic", "herbal", "original", "item", "product"
 }
 
-# These are identity-bearing ingredients, unlike generic listing language such
-# as "natural", "extract", "bar", or "bathing". Keep this deliberately small:
-# uncertain ingredient equivalence remains the LLM's responsibility.
-IDENTITY_INGREDIENTS: Set[str] = {"turmeric", "neem"}
-PRODUCT_TYPES: Set[str] = {"soap", "shampoo", "facewash", "face", "wash", "cleanser", "cake"}
+# These are identity-bearing formulation cues; generic descriptors are omitted.
+IDENTITY_INGREDIENTS: Set[str] = {
+    "aloe", "ashwagandha", "turmeric", "neem", "tea", "tree", "salicylic",
+    "benzoyl", "peroxide", "niacinamide", "retinol", "hyaluronic", "vitamin",
+    "charcoal", "sandalwood", "rosehip", "hibiscus", "coconut", "goat", "milk",
+    "cucumber", "jojoba", "argan",
+}
+PRODUCT_TYPES: Set[str] = {
+    "soap", "shampoo", "facewash", "face", "wash", "cleanser", "cake",
+    "gel", "cream", "oil", "serum", "lotion", "conditioner", "powder",
+    "capsule", "tablet", "syrup", "spray",
+}
 
 
 class IdentityDecision(str, Enum):
@@ -83,6 +90,25 @@ def _identity_tokens(text: str) -> Set[str]:
     return set(extract_search_tokens(text))
 
 
+def _identity_ingredients(text: str) -> Set[str]:
+    tokens = set(extract_search_tokens((text or "").casefold().replace("aloevera", "aloe vera")))
+    found = tokens & IDENTITY_INGREDIENTS
+    if "aloe" in found:
+        found.discard("aloe")
+        found.add("aloe vera")
+    if {"tea", "tree"}.issubset(found):
+        found -= {"tea", "tree"}
+        found.add("tea tree")
+    for pair, phrase in (({"salicylic", "acid"}, "salicylic acid"),
+                         ({"hyaluronic", "acid"}, "hyaluronic acid"),
+                         ({"benzoyl", "peroxide"}, "benzoyl peroxide"),
+                         ({"vitamin", "c"}, "vitamin c")):
+        if pair.issubset(tokens):
+            found -= pair
+            found.add(phrase)
+    return found
+
+
 def _deterministic_identity(candidate: ProductCatalog, name: str, details: str) -> Optional[bool]:
     """Return True/False only for high-confidence identity evidence."""
     incoming_name = _identity_tokens(name)
@@ -92,21 +118,21 @@ def _deterministic_identity(candidate: ProductCatalog, name: str, details: str) 
 
     incoming_types = incoming_evidence & PRODUCT_TYPES
     candidate_types = candidate_evidence & PRODUCT_TYPES
-    if incoming_types and candidate_types and incoming_types.isdisjoint(candidate_types):
+    if incoming_types and candidate_types:
+        if incoming_types.isdisjoint(candidate_types):
+            washing_forms = {"face", "facewash", "wash", "cleanser"}
+            if not (incoming_types & washing_forms and candidate_types & washing_forms):
+                return False
+        elif candidate_types - incoming_types and not (candidate_types - incoming_types) <= {"face", "facewash", "wash", "cleanser"}:
+            return False
+
+    incoming_ingredients = _identity_ingredients(f"{name} {details}")
+    candidate_ingredients = _identity_ingredients(f"{candidate.name or ''} {candidate.product_details or ''}")
+    if incoming_ingredients and candidate_ingredients and incoming_ingredients != candidate_ingredients:
         return False
 
-    incoming_ingredients = incoming_evidence & IDENTITY_INGREDIENTS
-    candidate_ingredients = candidate_evidence & IDENTITY_INGREDIENTS
-    if incoming_ingredients and candidate_ingredients and incoming_ingredients.isdisjoint(candidate_ingredients):
-        return False
-
-    # Exact generic product identity is safe to resolve without a model call.
-    # Ignore descriptors, brands, and categories; retain product type and
-    # identity-bearing name tokens to avoid merging distinct variants.
-    incoming_core = incoming_name - PRODUCT_TYPES
-    candidate_core = candidate_name - PRODUCT_TYPES
-    if incoming_core == candidate_core and incoming_core:
-        return True
+    # Positive identity decisions remain with the identity service's validated
+    # resolver. Deterministic checks are used only to reject clear conflicts.
     return None
 
 
@@ -284,18 +310,10 @@ def evaluate_product_identity(
             identity_factors=["empty_catalog"],
         )
 
-    # Resolve only clear-cut identity cases deterministically. This keeps basic
-    # catalog reuse available when Ollama is offline and prevents explicit
-    # ingredient/type conflicts from being overridden by generic word overlap.
+    # Deterministic checks reject explicit identity conflicts before the model;
+    # they do not treat token overlap as proof of an exact product match.
     decisions = [(candidate, _deterministic_identity(candidate, product_name, product_details))
                  for candidate in candidates]
-    for candidate, decision in decisions:
-        if decision is True:
-            return IdentityOutput(
-                decision=IdentityDecision.MATCH, matched_catalog_id=candidate.id,
-                confidence=1.0, reason="Same generic product identity; brand is supporting metadata",
-                identity_factors=["product_name_identity", "brand_neutral"],
-            )
     candidates = [candidate for candidate, decision in decisions if decision is not False]
     if not candidates:
         return IdentityOutput(

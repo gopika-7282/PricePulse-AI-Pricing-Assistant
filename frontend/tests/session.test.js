@@ -427,12 +427,18 @@ test('recommendation card maps persisted price, range, reasoning, and basis afte
   assert.match(frontend, /recommended_price_min/);
   assert.match(frontend, /recommended_price_max/);
   assert.match(frontend, /recommendation\.reasoning/);
-  assert.match(frontend, /Pricing basis:/);
-  assert.match(frontend, /Minimum selling price/);
-  assert.match(frontend, /Expected gross profit per pack/);
-  assert.match(frontend, /Expected margin on cost/);
-  assert.match(frontend, /Headroom above minimum/);
-  assert.match(frontend, /marketPriceRangeDisplay \|\| 'Not available'/);
+  assert.match(frontend, /Pricing method:/);
+  assert.match(frontend, /Market-data-backed recommendation/);
+  assert.match(frontend, /Market data \+ local AI estimate/);
+  assert.match(frontend, /Local AI estimate — no sufficient live market data/);
+  assert.match(frontend, /Offer prices \(listed \/ normalized\)/);
+  assert.match(frontend, /Minimum profitable selling price/);
+  assert.match(frontend, /Estimated market reference \(median\)/);
+  assert.match(frontend, /Typical comparable range \(Q1–Q3\)/);
+  assert.match(frontend, /Gross profit per pack/);
+  assert.match(frontend, /Markup on cost/);
+  assert.match(frontend, /Gross margin on selling price/);
+  assert.match(frontend, /market_price_range_display/);
 });
 
 test('Accept Price uses the authenticated persistence endpoint', async () => {

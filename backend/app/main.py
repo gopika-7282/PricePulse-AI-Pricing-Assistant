@@ -3,6 +3,8 @@ from app.database import engine, Base
 import app.models
 import logging
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from app.config import CORS_ORIGINS
 from fastapi import Request
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
@@ -45,7 +47,7 @@ async def handle_validation_error(request: Request, exc: RequestValidationError)
 # normal responses. Credentialed JWT requests stay restricted to the Vite UI.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -63,3 +65,10 @@ def home():
         "message": "Welcome to PricePulse API",
         "status": "Running"
     }
+
+@app.get("/health")
+def health():
+    """Hosting health check that verifies the configured PostgreSQL connection."""
+    with engine.connect() as connection:
+        connection.execute(text("SELECT 1"))
+    return {"status": "ok"}

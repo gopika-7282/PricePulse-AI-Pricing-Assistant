@@ -33,6 +33,7 @@ import logging
 import hashlib
 import json
 import math
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -46,7 +47,9 @@ logger = logging.getLogger(__name__)
 # ---- Paths & constants -------------------------------------------------------
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]   # ./PrintPulse
-CHROMA_PERSIST_DIR = str(_PROJECT_ROOT / "chroma_db")
+CHROMA_PERSIST_DIR = os.getenv(
+    "CHROMA_PERSIST_DIRECTORY", str(_PROJECT_ROOT / "chroma_db")
+)
 
 PRICING_RAG_COLLECTION = "pricing_rag"
 PRODUCT_RAG_COLLECTION  = "product_rag"

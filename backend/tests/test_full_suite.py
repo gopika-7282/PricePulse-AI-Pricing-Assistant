@@ -129,13 +129,17 @@ class TestSemanticMatching:
         db.add(cat)
         db.flush()
 
-        match = find_catalog_match(
-            db,
-            name="Turmeric Soap",
-            category="Personal Care",
-            brand="Siva's Organic",
-            details="Natural herbal turmeric soap 100g"
-        )
+        with patch("app.services.product_identity_service.generate_structured", return_value={
+            "success": True,
+            "data": {"decision": "MATCH", "matched_catalog_id": cat.id, "confidence": 1.0, "reason": "Mocked identity response."},
+        }):
+            match = find_catalog_match(
+                db,
+                name="Turmeric Soap",
+                category="Personal Care",
+                brand="Siva's Organic",
+                details="Natural herbal turmeric soap 100g"
+            )
         assert match is not None
         assert match.id == cat.id
 
@@ -195,13 +199,17 @@ class TestSemanticMatching:
         db.flush()
 
         # Incoming has completely different brand "Patanjali"
-        match = find_catalog_match(
-            db,
-            name="Turmeric Soap",
-            category="Personal Care",
-            brand="Patanjali",
-            details="Natural turmeric soap"
-        )
+        with patch("app.services.product_identity_service.generate_structured", return_value={
+            "success": True,
+            "data": {"decision": "MATCH", "matched_catalog_id": cat.id, "confidence": 1.0, "reason": "Mocked identity response."},
+        }):
+            match = find_catalog_match(
+                db,
+                name="Turmeric Soap",
+                category="Personal Care",
+                brand="Patanjali",
+                details="Natural turmeric soap"
+            )
         assert match is not None
         assert match.id == cat.id
 
@@ -217,13 +225,17 @@ class TestSemanticMatching:
         db.flush()
 
         # Incoming uses "Bath & Body" instead of "Personal Care"
-        match = find_catalog_match(
-            db,
-            name="Turmeric Soap",
-            category="Bath & Body",
-            brand="Siva's Organic",
-            details="Natural herbal turmeric soap"
-        )
+        with patch("app.services.product_identity_service.generate_structured", return_value={
+            "success": True,
+            "data": {"decision": "MATCH", "matched_catalog_id": cat.id, "confidence": 1.0, "reason": "Mocked identity response."},
+        }):
+            match = find_catalog_match(
+                db,
+                name="Turmeric Soap",
+                category="Bath & Body",
+                brand="Siva's Organic",
+                details="Natural herbal turmeric soap"
+            )
         assert match is not None
         assert match.id == cat.id
 
@@ -341,6 +353,7 @@ class TestFreshness:
             product_url="https://www.flipkart.com/test/p/itm123",
             price=299.0,
             scraped_at=datetime.now(timezone.utc) - timedelta(days=2),
+            observation_source="SCRAPE",
         )
         db.add(comp)
         db.flush()
@@ -360,6 +373,7 @@ class TestFreshness:
             product_url="https://www.flipkart.com/test/p/itm123",
             price=299.0,
             scraped_at=datetime.now(timezone.utc) - timedelta(days=10),
+            observation_source="SCRAPE",
         )
         db.add(comp)
         db.flush()
@@ -388,6 +402,7 @@ class TestFreshness:
             product_url="https://www.flipkart.com/soap/p/itm1",
             price=150.0,
             scraped_at=original_time,
+            observation_source="SCRAPE",
         )
         db.add(comp)
         db.commit()
@@ -417,6 +432,7 @@ class TestFreshness:
             product_url="https://www.flipkart.com/soap/p/itm1",
             price=150.0,
             scraped_at=old_time,
+            observation_source="SCRAPE",
         )
         db.add(comp)
         db.commit()
@@ -430,6 +446,7 @@ class TestFreshness:
             "rating": 4.3,
             "product_details": ["Natural soap"],
             "availability": True,
+            "scraped_at": datetime.now(timezone.utc).isoformat(),
         }]
 
         with patch("app.services.scraping_service.ScoutScraper.get_competitor_data", return_value=mock_data):
@@ -465,7 +482,8 @@ class TestCompetitorUpsertAndHistory:
             platform_name="Flipkart",
             product_name="Smart Watch v1",
             price=2499.0,
-            product_url="https://www.flipkart.com/watch/p/itm99?pid=WTC123"
+            product_url="https://www.flipkart.com/watch/p/itm99?pid=WTC123",
+            scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE",
         )
         db.flush()
 
@@ -475,7 +493,8 @@ class TestCompetitorUpsertAndHistory:
             platform_name="Flipkart",
             product_name="Smart Watch v1 Updated",
             price=2499.0,
-            product_url="https://www.flipkart.com/watch/p/itm99?pid=WTC123"
+            product_url="https://www.flipkart.com/watch/p/itm99?pid=WTC123",
+            scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE",
         )
         db.flush()
 
@@ -497,7 +516,7 @@ class TestCompetitorUpsertAndHistory:
             price=199.0,
             product_url="https://www.flipkart.com/scrub/p/itm44",
             product_details="Old details",
-            rating=4.0
+            rating=4.0, scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE",
         )
         db.flush()
 
@@ -510,7 +529,7 @@ class TestCompetitorUpsertAndHistory:
             price=189.0,
             product_url="https://www.flipkart.com/scrub/p/itm44",
             product_details="New enriched details",
-            rating=4.4
+            rating=4.4, scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE",
         )
         db.flush()
 
@@ -533,7 +552,8 @@ class TestCompetitorUpsertAndHistory:
             platform_name="Flipkart",
             product_name="Organic Honey 500g",
             price=250.0,
-            product_url="https://www.flipkart.com/honey/p/itm88"
+            product_url="https://www.flipkart.com/honey/p/itm88",
+            scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE",
         )
         db.flush()
 
@@ -548,7 +568,8 @@ class TestCompetitorUpsertAndHistory:
             platform_name="Flipkart",
             product_name="Organic Honey 500g",
             price=230.0,
-            product_url="https://www.flipkart.com/honey/p/itm88"
+            product_url="https://www.flipkart.com/honey/p/itm88",
+            scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE",
         )
         db.flush()
 
@@ -573,7 +594,8 @@ class TestCompetitorUpsertAndHistory:
             platform_name="Flipkart",
             product_name="Pure Olive Oil 1L",
             price=850.0,
-            product_url="https://www.flipkart.com/olive/p/itm77"
+            product_url="https://www.flipkart.com/olive/p/itm77",
+            scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE",
         )
         db.flush()
 
@@ -584,7 +606,8 @@ class TestCompetitorUpsertAndHistory:
             platform_name="Flipkart",
             product_name="Pure Olive Oil 1L",
             price=850.0,
-            product_url="https://www.flipkart.com/olive/p/itm77"
+            product_url="https://www.flipkart.com/olive/p/itm77",
+            scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE",
         )
         db.flush()
 

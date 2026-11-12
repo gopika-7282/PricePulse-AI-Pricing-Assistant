@@ -37,7 +37,7 @@ MATCH_CONFIG = {
 }
 
 # Qwen3 / Ollama configuration
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434")
 OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL", "qwen3:8b")
 def _ollama_timeout(name: str, default: float) -> float:
     raw = os.getenv(name, str(default))
@@ -72,3 +72,6 @@ EMAIL_DELIVERY_CONFIGURED = all(
 )
 # Compatibility alias for clients/tests using the earlier setting name.
 FRONTEND_URL = FRONTEND_BASE_URL
+CORS_ORIGINS = [origin.strip() for origin in os.getenv(
+    "CORS_ORIGINS", "http://localhost:5173"
+).split(",") if origin.strip()]

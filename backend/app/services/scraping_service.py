@@ -203,8 +203,16 @@ def scrape_product(db: Session, catalog_product: ProductCatalog, platforms=None,
                 else:
                     details_str = str(details) if details else ""
 
-                from app.utils.quantity import extract_quantity
-                quantity = extract_quantity(f"{data['product_title']} {details_str}") or {}
+                from app.utils.quantity import mark_quantity_provenance, reconcile_quantity
+                from app.services.relevance_filter_service import mark_match_quality
+                quantity = reconcile_quantity(
+                    title=data.get("product_title"), details=details_str,
+                    scraper_metadata=data,
+                )
+                resolved = quantity["status"] == "resolved"
+                persisted_details = mark_match_quality(details_str, data.get("match_quality"))
+                if resolved:
+                    persisted_details = mark_quantity_provenance(persisted_details, quantity.get("evidence", []))
 
                 upsert_competitor_product(
                     db=db,
@@ -213,14 +221,19 @@ def scrape_product(db: Session, catalog_product: ProductCatalog, platforms=None,
                     product_name=data["product_title"],      # standardized key
                     price=data["price"],
                     product_url=data.get("product_url"),
-                    product_details=details_str,
+                    product_details=persisted_details,
                     rating=data.get("rating"),
                     availability=data.get("availability"),
-                    quantity_value=data.get("quantity_value") or quantity.get("quantity_value"),
-                    quantity_unit=data.get("quantity_unit") or quantity.get("quantity_unit"),
-                    pack_count=data.get("pack_count") or quantity.get("pack_count"),
-                    total_quantity=data.get("total_quantity") or quantity.get("total_quantity"),
-                    total_quantity_unit=data.get("total_quantity_unit") or quantity.get("total_quantity_unit"),
+                    quantity_value=quantity.get("quantity_value") if resolved else None,
+                    quantity_unit=quantity.get("quantity_unit") if resolved else None,
+                    pack_count=quantity.get("pack_count") if resolved else None,
+                    total_quantity=quantity.get("total_quantity") if resolved else None,
+                    total_quantity_unit=quantity.get("total_quantity_unit") if resolved else None,
+                    quantity_status=quantity["status"],
+                    quantity_evidence=quantity.get("evidence", []),
+                    quantity_reason=quantity.get("reason"),
+                    scraped_at=datetime.fromisoformat(data["scraped_at"].replace("Z", "+00:00")),
+                    observation_source="SCRAPE",
                 )
                 stored_count += 1
 

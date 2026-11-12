@@ -50,6 +50,8 @@ from app.services.product_service import (
 )
 from app.services.competitor_service import (
     upsert_competitor_product,
+    create_manual_competitor_product,
+    update_competitor_price,
     has_fresh_competitor_data,
     get_competitor_price_history,
     save_price_history,
@@ -97,6 +99,7 @@ def make_competitor(db, catalog_id, platform="Flipkart", name="Test", price=100.
         price=price,
         product_url=url,
         scraped_at=now,
+        observation_source="SCRAPE",
     )
     db.add(c)
     db.flush()
@@ -121,8 +124,9 @@ class TestCatalogMatching:
 
     # T1 — Exact product match
     def test_exact_product_match(self, db):
-        make_catalog(db, "Turmeric Soap", brand="Himalaya")
-        result = find_existing_product(db, "Turmeric Soap", "Personal Care", "Himalaya")
+        catalog = make_catalog(db, "Turmeric Soap", brand="Himalaya")
+        with patch("app.services.product_identity_service.generate_structured", return_value={"success": True, "data": {"decision": "MATCH", "matched_catalog_id": catalog.id, "confidence": 1.0, "reason": "Mocked identity response."}}):
+            result = find_existing_product(db, "Turmeric Soap", "Personal Care", "Himalaya")
         assert result is not None, "Exact match should return existing catalog"
 
     # T2 — Turmeric vs Haldi (semantic match)
@@ -143,8 +147,9 @@ class TestCatalogMatching:
 
     # T4 — Same product, different brands → MATCH
     def test_different_brands_same_product_matches(self, db):
-        make_catalog(db, "Turmeric Soap", brand="Siva's Organic", category="Personal Care")
-        result = find_existing_product(db, "Turmeric Soap", "Personal Care", "Himalaya")
+        catalog = make_catalog(db, "Turmeric Soap", brand="Siva's Organic", category="Personal Care")
+        with patch("app.services.product_identity_service.generate_structured", return_value={"success": True, "data": {"decision": "MATCH", "matched_catalog_id": catalog.id, "confidence": 1.0, "reason": "Mocked identity response."}}):
+            result = find_existing_product(db, "Turmeric Soap", "Personal Care", "Himalaya")
         assert result is not None, "Different brands must NOT prevent catalog reuse"
 
     # T5 — Different product type → NO MATCH
@@ -173,8 +178,9 @@ class TestCatalogMatching:
 
     # T_extra — Turmeric Soap vs Turmeric Herbal Soap → MATCH
     def test_turmeric_herbal_soap_matches(self, db):
-        make_catalog(db, "Turmeric Soap", brand="Himalaya", category="Personal Care")
-        result = find_existing_product(db, "Turmeric Herbal Soap", "Personal Care", "Himalaya")
+        catalog = make_catalog(db, "Turmeric Soap", brand="Himalaya", category="Personal Care")
+        with patch("app.services.product_identity_service.generate_structured", return_value={"success": True, "data": {"decision": "MATCH", "matched_catalog_id": catalog.id, "confidence": 1.0, "reason": "Mocked identity response."}}):
+            result = find_existing_product(db, "Turmeric Herbal Soap", "Personal Care", "Himalaya")
         assert result is not None, "Turmeric Herbal Soap should match Turmeric Soap"
 
 
@@ -218,13 +224,15 @@ class TestCompetitorUpsert:
         url = "https://flipkart.com/p/abc123"
 
         comp1 = upsert_competitor_product(
-            db, cat.id, "Flipkart", "Upsert Soap v1", 100.0, url, None, 4.0, True
+            db, cat.id, "Flipkart", "Upsert Soap v1", 100.0, url, None, 4.0, True,
+            scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE"
         )
         db.flush()
         first_id = comp1.id
 
         comp2 = upsert_competitor_product(
-            db, cat.id, "Flipkart", "Upsert Soap v2", 120.0, url, None, 4.2, True
+            db, cat.id, "Flipkart", "Upsert Soap v2", 120.0, url, None, 4.2, True,
+            scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE"
         )
         db.flush()
 
@@ -238,9 +246,11 @@ class TestCompetitorUpsert:
         cat = make_catalog(db, "History Soap")
         url = "https://flipkart.com/p/hist001"
 
-        upsert_competitor_product(db, cat.id, "Flipkart", "History Soap", 100.0, url)
+        upsert_competitor_product(db, cat.id, "Flipkart", "History Soap", 100.0, url,
+                                  scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE")
         db.flush()
-        upsert_competitor_product(db, cat.id, "Flipkart", "History Soap", 130.0, url)
+        upsert_competitor_product(db, cat.id, "Flipkart", "History Soap", 130.0, url,
+                                  scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE")
         db.flush()
 
         comp = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).first()
@@ -255,9 +265,11 @@ class TestCompetitorUpsert:
         cat = make_catalog(db, "Same Price Soap")
         url = "https://flipkart.com/p/same001"
 
-        upsert_competitor_product(db, cat.id, "Flipkart", "Same Soap", 99.0, url)
+        upsert_competitor_product(db, cat.id, "Flipkart", "Same Soap", 99.0, url,
+                                  scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE")
         db.flush()
-        upsert_competitor_product(db, cat.id, "Flipkart", "Same Soap", 99.0, url)
+        upsert_competitor_product(db, cat.id, "Flipkart", "Same Soap", 99.0, url,
+                                  scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE")
         db.flush()
 
         comp = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).first()
@@ -266,12 +278,30 @@ class TestCompetitorUpsert:
 
     def test_new_product_always_gets_history(self, db):
         cat = make_catalog(db, "Brand New Soap")
-        upsert_competitor_product(db, cat.id, "Flipkart", "New Soap", 50.0)
+        upsert_competitor_product(db, cat.id, "Flipkart", "New Soap", 50.0,
+                                  scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE")
         db.flush()
 
         comp = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).first()
         history = get_competitor_price_history(db, comp.id)
         assert len(history) == 1, "New competitor must have 1 history entry"
+
+    def test_manual_competitor_price_is_not_scrape_freshness_or_history(self, db):
+        cat = make_catalog(db, "Manual Price Soap")
+        manual = create_manual_competitor_product(
+            db, catalog_product_id=cat.id, platform_name="Manual",
+            product_name="Store entered listing", price=85.0,
+        )
+        db.flush()
+        assert manual.observation_source == "MANUAL"
+        assert manual.scraped_at is not None  # storage default is not provenance
+        assert get_competitor_price_history(db, manual.id) == []
+        assert has_fresh_competitor_data(db, cat.id, threshold_days=7) is False
+
+        update_competitor_price(db, manual.id, 90.0)
+        assert manual.price == 90.0
+        assert manual.scraped_at is not None
+        assert get_competitor_price_history(db, manual.id) == []
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -467,7 +497,10 @@ class TestScrapingService:
 
         comp = db.query(CompetitorProduct).filter_by(catalog_product_id=cat.id).first()
         assert comp is not None
-        stored = json.loads(comp.product_details)
+        from app.utils.quantity import strip_quantity_marker
+        from app.services.relevance_filter_service import strip_match_marker
+        assert "[[PRICEPULSE_QUANTITY_EVIDENCE:" in comp.product_details
+        stored = json.loads(strip_match_marker(strip_quantity_marker(comp.product_details)))
         assert stored == details_list
 
 

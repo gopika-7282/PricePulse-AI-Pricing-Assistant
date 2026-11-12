@@ -316,6 +316,15 @@ class TestProductIdentityAgent:
             )
         assert result.decision == IdentityDecision.NEW_PRODUCT
 
+    def test_aloe_gel_and_aloe_ashwagandha_are_not_same_catalog_identity(self, db):
+        make_catalog(db, "Aloe Vera Gel", details="Aloe gel with ashwagandha extract")
+        with patch("app.services.product_identity_service.generate_structured") as generate:
+            result = evaluate_product_identity(
+                db, "Aloe Vera Gel", product_details="Pure aloe vera gel"
+            )
+        assert result.decision == IdentityDecision.NEW_PRODUCT
+        generate.assert_not_called()
+
     def test_same_category_different_product_no_match(self, db):
         """NOT_MATCH: Same category, clearly different product."""
         make_catalog(db, "Hibiscus Hair Oil", category="Hair Care",

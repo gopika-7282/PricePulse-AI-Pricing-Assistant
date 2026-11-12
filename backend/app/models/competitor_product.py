@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, Text, Boolean, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, Float, Text, Boolean, ForeignKey, DateTime, Sequence, text
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -7,7 +7,7 @@ from app.database import Base
 class CompetitorProduct(Base):
     __tablename__ = "competitor_products"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, Sequence("competitor_products_id_seq"), primary_key=True)
     catalog_product_id = Column(Integer, ForeignKey("product_catalog.id", ondelete="CASCADE"), nullable=False, index=True)
     platform_name = Column(String, nullable=False, index=True)
     product_name = Column(String, nullable=False)
@@ -21,8 +21,14 @@ class CompetitorProduct(Base):
     total_quantity_unit = Column(String(16), nullable=True)
     rating = Column(Float, nullable=True)
     availability = Column(Boolean, nullable=True, default=None)
+    observation_source = Column(
+        String(16), nullable=False, default="LEGACY_UNKNOWN",
+        server_default=text("'LEGACY_UNKNOWN'"),
+    )
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
+    # This required storage timestamp is not evidence: only SCRAPE provenance plus
+    # an actual scraper-supplied observation time qualifies as market evidence.
     scraped_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     catalog_product = relationship("ProductCatalog", back_populates="competitor_products")

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, Text, Boolean, ForeignKey, DateTime, String
+from sqlalchemy import Column, Integer, Float, Text, Boolean, ForeignKey, DateTime, String, Sequence
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -7,7 +7,7 @@ from app.database import Base
 class Recommendation(Base):
     __tablename__ = "recommendations"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, Sequence("recommendations_id_seq"), primary_key=True)
     retailer_product_id = Column(Integer, ForeignKey("retailer_products.id", ondelete="CASCADE"), nullable=False, index=True)
     recommended_price = Column(Float, nullable=False)
     recommended_price_min = Column(Float, nullable=True)

@@ -49,12 +49,14 @@ def filter_relevant_competitors(
             "price": c.price,
             "rating": c.rating,
             "availability": c.availability,
+            "product_details": c.product_details or "",
         })
 
     relevant_results = filter_candidate_products(
         target_name=catalog_product.name,
         target_category=catalog_product.category or "",
         candidates=comp_dicts,
+        target_details=catalog_product.product_details or "",
     )
 
     relevant_ids = {r["competitor_product_id"] for r in relevant_results}

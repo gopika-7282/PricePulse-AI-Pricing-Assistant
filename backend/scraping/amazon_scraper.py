@@ -29,6 +29,7 @@ def select_amazon_candidates(
     product_name: str,
     category: Optional[str],
     max_products: Optional[int],
+    product_details: Optional[str] = None,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """Deduplicate, validate and relevance-filter the full search result before capping."""
     limit = min(max_products or DEFAULT_MAX_PRODUCTS, HARD_MAX_PRODUCTS)
@@ -53,6 +54,7 @@ def select_amazon_candidates(
         target_name=product_name,
         target_category=category or "",
         candidates=validated,
+        target_details=product_details or "",
     )
     # Amazon's search result position is the existing relevance ranking. Preserve it
     # while applying the hard cap only after validation and relevance filtering.
@@ -531,6 +533,12 @@ class AmazonScraper(BaseScraper):
             "product_details": detailed.get("product_details") or cand.get("product_details", []),
             "scraped_at": scraped_at,
             "ranking": cand.get("ranking", idx),
+            "match_quality": cand.get("match_quality"),
+            "quantity_value": cand.get("quantity_value"),
+            "quantity_unit": cand.get("quantity_unit"),
+            "pack_count": cand.get("pack_count"),
+            "total_quantity": cand.get("total_quantity"),
+            "total_quantity_unit": cand.get("total_quantity_unit"),
         }
 
         self.log_diagnostic("Amazon", "detail_parse", requested_url=cand_url,
@@ -612,7 +620,7 @@ class AmazonScraper(BaseScraper):
                         }
 
                     selected, _candidate_counts = select_amazon_candidates(
-                        candidates, product_name, category, limit
+                        candidates, product_name, category, limit, product_details=product_details
                     )
                     self.log_diagnostic("Amazon", "candidate_selection", product_card_count=len(candidates),
                                         normalized_product_count=len(selected), reason_category="relevance_filtered")

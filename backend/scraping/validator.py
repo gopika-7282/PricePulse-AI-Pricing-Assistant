@@ -34,10 +34,7 @@ class ScrapedProductSchema(BaseModel):
     price: float = Field(..., gt=0, description="Product price in INR (must be > 0)")
     rating: Optional[float] = Field(default=None, description="Product rating [0.0 - 5.0]")
     availability: Optional[bool] = Field(default=None, description="Stock availability when explicitly reported")
-    scraped_at: str = Field(
-        default_factory=lambda: datetime.now(timezone.utc).isoformat(),
-        description="ISO-8601 UTC timestamp of scraping execution"
-    )
+    scraped_at: str = Field(..., description="ISO-8601 UTC timestamp captured by the collector")
     product_details: Optional[Any] = Field(
         default_factory=list,
         description="Scraped product details or specifications"
@@ -47,6 +44,7 @@ class ScrapedProductSchema(BaseModel):
     pack_count: Optional[int] = Field(default=None, gt=0)
     total_quantity: Optional[float] = Field(default=None, gt=0)
     total_quantity_unit: Optional[str] = None
+    match_quality: Optional[str] = None
 
     @field_validator("platform", "product_title", "product_url", mode="before")
     @classmethod
@@ -96,11 +94,12 @@ def validate_scraped_product(data: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "price": data.get("price"),
         "rating": data.get("rating"),
         "availability": data.get("availability"),
-        "scraped_at": data.get("scraped_at") or datetime.now(timezone.utc).isoformat(),
+        "scraped_at": data.get("scraped_at"),
         "product_details": data.get("product_details", []),
         "quantity_value": data.get("quantity_value"), "quantity_unit": data.get("quantity_unit"),
         "pack_count": data.get("pack_count"), "total_quantity": data.get("total_quantity"),
         "total_quantity_unit": data.get("total_quantity_unit"),
+        "match_quality": data.get("match_quality"),
     }
 
     try:

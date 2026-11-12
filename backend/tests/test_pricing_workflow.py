@@ -16,7 +16,8 @@ def test_graph_has_bounded_four_agent_flow_nodes():
     assert {"identity", "catalog_decision", "freshness", "scout", "rag", "strategist", "compliance", "persistence"}.issubset(nodes)
     assert route_identity({"error": "uncertain"}) == "stop"
     assert route_identity({"identity": {"decision": "MATCH"}}) == "catalog"
-    assert route_freshness({"fresh": True}) == "rag"
+    # Analysis now refreshes marketplace observations even when stored rows are fresh.
+    assert route_freshness({"fresh": True}) == "scout"
     assert route_freshness({"fresh": False}) == "scout"
 
 

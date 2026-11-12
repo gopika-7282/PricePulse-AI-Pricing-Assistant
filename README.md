@@ -89,3 +89,15 @@ Price Recommendation
 PostgreSQL
    ↓
 React Dashboard
+
+---
+
+## CI/CD
+
+PricePulse uses GitHub Actions to check the existing FastAPI backend, React/Vite frontend, PostgreSQL migrations, and Docker builds. CI runs on branch pushes, pull requests targeting `main`, and manual dispatch. Backend CI installs Python 3.10 dependencies from the root `requirements.txt`, validates imports, applies Alembic migrations against an isolated PostgreSQL 16 test database, and runs the existing pytest suite. Frontend CI uses the Node test runner (`npm test`) and creates the Vite production build (`npm run build`) using the committed lockfile. See [docs/CI_CD_GUIDE.md](docs/CI_CD_GUIDE.md) for commands and troubleshooting.
+
+The backend suite exercises scraper parsing and diagnostics, agent/pricing workflow behavior, retrieval, and mocked LLM interfaces. Normal CI does not scrape live marketplaces or require Ollama/Qwen3:8b. Chroma uses an isolated temporary location in CI; local operation keeps the existing `chroma_db` default. PostgreSQL migrations run only against the ephemeral CI service.
+
+Docker validation builds backend and frontend images without publishing them. After CI succeeds for a pushed `v*` tag, the release workflow verifies that exact tag commit and creates a versioned GitHub Release bundle with frontend assets, Docker image archives, build metadata, and a checksum. No GitHub Actions secrets are required for checks or artifacts. Runtime credentials must be supplied by the chosen deployment environment.
+
+Production deployment is not configured because the hosting target has not been selected. Automatic deployment requires a target, runtime secret storage, public frontend API/CORS configuration, persistent database and Chroma storage, a migration/rollback policy, and a reachable Ollama endpoint with Qwen3:8b. No production deployment is performed by these workflows.

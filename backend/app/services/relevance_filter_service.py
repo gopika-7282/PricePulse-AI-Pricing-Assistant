@@ -32,6 +32,36 @@ PRODUCT_TYPES = [
     "wash", "lotion", "conditioner", "cleanser", "scrub", "mask", "cake", "tablet",
     "capsule", "syrup", "powder", "tea", "coffee", "perfume", "spray"
 ]
+FORMULATION_TERMS = {
+    "aloe", "aloe vera", "ashwagandha", "turmeric", "neem", "tea tree",
+    "salicylic acid", "benzoyl peroxide", "niacinamide", "retinol",
+    "hyaluronic acid", "vitamin c", "charcoal", "sandalwood", "rosehip",
+    "hibiscus", "coconut", "goat milk", "vitamin e", "cucumber", "jojoba", "argan",
+    "rosemary",
+}
+_MATCH_MARKER = "[[PRICEPULSE_MATCH:"
+
+
+def mark_match_quality(details: str | None, quality: str | None) -> str | None:
+    if quality not in {"exact", "alternative"}:
+        return details
+    raw = (details or "").split(_MATCH_MARKER, 1)[0].rstrip()
+    return f"{raw}\n{_MATCH_MARKER}{quality}]]".strip()
+
+
+def get_match_quality(details: str | None) -> str:
+    if details and _MATCH_MARKER in details:
+        value = details.split(_MATCH_MARKER, 1)[1].split("]]", 1)[0]
+        return value if value in {"exact", "alternative"} else "uncertain"
+    return "exact"  # Existing records predate explicit classification.
+
+
+def strip_match_marker(details: str | None) -> str | None:
+    if not details or _MATCH_MARKER not in details:
+        return details
+    prefix, rest = details.split(_MATCH_MARKER, 1)
+    suffix = rest.split("]]", 1)[1] if "]]" in rest else ""
+    return (prefix + suffix).strip() or None
 
 
 def _detect_types(text: str) -> Set[str]:
@@ -45,12 +75,71 @@ def _detect_types(text: str) -> Set[str]:
     return found
 
 
-def _cache_key(target: str, candidate_title: str) -> str:
-    combined = f"{target.strip().lower()}::{candidate_title.strip().lower()}"
+def _cache_key(target: str, candidate_title: str, target_details: str = "", candidate_details: str = "") -> str:
+    combined = f"{target.strip().lower()}::{target_details.strip().lower()}::{candidate_title.strip().lower()}::{candidate_details.strip().lower()}"
     return hashlib.md5(combined.encode("utf-8")).hexdigest()
 
 
-def lexical_relevance_check(target_name: str, candidate_title: str) -> Tuple[Optional[bool], str]:
+def classify_candidate(target_name: str, candidate_title: str, target_details: str = "",
+                       candidate_details: str = "") -> Tuple[str, str]:
+    """Apply deterministic safety checks before a candidate can affect pricing."""
+    target_text = f"{target_name} {target_details}".casefold().replace("aloevera", "aloe vera")
+    candidate_text = f"{candidate_title} {candidate_details}".casefold().replace("aloevera", "aloe vera")
+    # Explicitly exclude materially different product forms before shared
+    # ingredient words (such as "rosemary") can make a listing look relevant.
+    # Price is intentionally not considered by these checks.
+    target_is_serum = bool(re.search(r"\bserum\b", target_name.casefold()))
+    candidate_title_text = (candidate_title or "").casefold()
+    if target_is_serum and re.search(r"\b(?:kit|set|bundle|combo)\b", candidate_title_text):
+        return "rejected", "Listing is a kit, set, bundle, or combo rather than an individual serum."
+    if target_is_serum and re.search(r"\bessential\s+oil\b", candidate_title_text):
+        return "rejected", "Essential oil is a different product form from a hair serum."
+    if target_is_serum and re.search(r"\bhair\s+oil\b", candidate_title_text) and not re.search(r"\bhair\s+serum\b", candidate_title_text):
+        return "rejected", "Plain hair oil is a different product form from a hair serum."
+    target_title_types = _detect_types(target_name)
+    candidate_title_types = _detect_types(candidate_title or "")
+    # Product descriptions often contain recommendations, reviews, and use
+    # instructions that mention other forms (e.g. essential oil to use with a
+    # serum). Prefer the explicit listing title for product-form classification.
+    target_types = target_title_types or _detect_types(target_text)
+    candidate_types = candidate_title_types or _detect_types(candidate_text)
+    shared_types = target_types & candidate_types
+    if target_types and candidate_types and (not shared_types or candidate_types - target_types):
+        return "rejected", "Conflicting product form/type."
+    if target_types and not candidate_types:
+        return "uncertain", "Candidate product form is not established."
+    target_formulas = {term for term in FORMULATION_TERMS if term in target_text}
+    candidate_formulas = {term for term in FORMULATION_TERMS if term in candidate_text}
+    if "aloe" in target_formulas:
+        target_formulas.discard("aloe")
+        target_formulas.add("aloe vera")
+    if "aloe" in candidate_formulas:
+        candidate_formulas.discard("aloe")
+        candidate_formulas.add("aloe vera")
+    if target_formulas and candidate_formulas and target_formulas != candidate_formulas:
+        return "rejected", "Meaningful formulation or ingredient conflict."
+    if target_formulas and not candidate_formulas:
+        return "uncertain", "Candidate does not establish the target formulation."
+    if not target_formulas and candidate_formulas:
+        return "uncertain", "Candidate formulation is not established by the target evidence."
+    target_tokens = set(re.findall(r"[a-zA-Z0-9]+", target_name.casefold()))
+    candidate_tokens = set(re.findall(r"[a-zA-Z0-9]+", candidate_title.casefold()))
+    target_tokens = {part for token in target_tokens for part in ({"aloe", "vera"} if token == "aloevera" else {token})}
+    candidate_tokens = {part for token in candidate_tokens for part in ({"aloe", "vera"} if token == "aloevera" else {token})}
+    generic = {"gel", "cream", "soap", "oil", "shampoo", "product", "natural", "organic", "pure"}
+    target_tokens -= generic
+    candidate_tokens -= generic
+    common_tokens = target_tokens & candidate_tokens
+    if not common_tokens or len(common_tokens) / max(1, len(target_tokens)) < 0.75:
+        if not target_formulas or target_formulas != candidate_formulas:
+            return "uncertain", "No meaningful identity token is shared."
+        return "alternative", "Formulation and product type match; brand/title wording differs."
+    return ("exact" if target_tokens == candidate_tokens else "alternative",
+            "Compatible type and formulation; brand difference is allowed.")
+
+
+def lexical_relevance_check(target_name: str, candidate_title: str, target_details: str = "",
+                            candidate_details: str = "") -> Tuple[Optional[bool], str]:
     """
     Fast lexical evaluation.
     Returns:
@@ -58,36 +147,19 @@ def lexical_relevance_check(target_name: str, candidate_title: str) -> Tuple[Opt
         (False, reason) -> Definite reject
         (None, reason) -> Borderline (needs LLM)
     """
-    target_lower = target_name.lower()
-    cand_lower = candidate_title.lower()
-
-    target_types = _detect_types(target_lower)
-    cand_types = _detect_types(cand_lower)
-
-    # If target has a specific product type, check for conflicts
-    if target_types:
-        # Check conflicting types
-        # e.g. target is oil, cand is shampoo/soap/wash
-        conflicts = cand_types - target_types
-        # If cand has a conflicting type and does NOT share the target type
-        if conflicts and not (cand_types & target_types):
-            return False, f"Conflicting product type: candidate has {conflicts}, target is {target_types}"
-
-        # If both share the primary type (e.g. both are oil or both are soap)
-        if cand_types & target_types:
-            # Check key ingredient words from target
-            words = [w for w in re.findall(r"[a-zA-Z0-9]+", target_lower) if len(w) >= 4]
-            matching_words = [w for w in words if w in cand_lower]
-            if len(matching_words) >= 1:
-                return True, f"Lexical match on type {cand_types & target_types} and words {matching_words}"
-
-    return None, "Borderline product type or ambiguous wording"
+    quality, reason = classify_candidate(target_name, candidate_title, target_details, candidate_details)
+    if quality == "rejected":
+        return False, reason
+    if quality == "uncertain":
+        return None, reason
+    return True, reason
 
 
 def filter_candidate_products(
     target_name: str,
     target_category: str = "",
     candidates: List[Dict[str, Any]] = None,
+    target_details: str = "",
 ) -> List[Dict[str, Any]]:
     """
     Filter candidate competitor products to keep only relevant competitors.
@@ -101,18 +173,21 @@ def filter_candidate_products(
 
     for idx, cand in enumerate(candidates):
         title = cand.get("product_title") or cand.get("product_name") or ""
-        ckey = _cache_key(target_name, title)
-
+        details = cand.get("product_details") or ""
+        if isinstance(details, (list, dict)):
+            details = json.dumps(details, ensure_ascii=False)
+        ckey = _cache_key(target_name, title, target_details, str(details))
         if ckey in _RELEVANCE_CACHE:
             is_rel = _RELEVANCE_CACHE[ckey]
-            if is_rel:
-                accepted.append(cand)
+            quality, _ = classify_candidate(target_name, title, target_details, str(details))
+            if is_rel and quality in {"exact", "alternative"}:
+                accepted.append({**cand, "match_quality": quality})
             continue
-
-        decision, reason = lexical_relevance_check(target_name, title)
+        quality, _ = classify_candidate(target_name, title, target_details, str(details))
+        decision, reason = lexical_relevance_check(target_name, title, target_details, str(details))
         if decision is True:
             _RELEVANCE_CACHE[ckey] = True
-            accepted.append(cand)
+            accepted.append({**cand, "match_quality": quality})
         elif decision is False:
             _RELEVANCE_CACHE[ckey] = False
             logger.debug(f"[RELEVANCE_REJECTED_LEXICAL] '{title}' - {reason}")
@@ -167,20 +242,22 @@ OUTPUT FORMAT (JSON object with 'results' array):
 
         for idx, cand in borderline:
             title = cand.get("product_title") or cand.get("product_name") or ""
-            ckey = _cache_key(target_name, title)
+            details = cand.get("product_details") or ""
+            if isinstance(details, (list, dict)):
+                details = json.dumps(details, ensure_ascii=False)
+            ckey = _cache_key(target_name, title, target_details, str(details))
             if idx in results_map:
                 is_rel = results_map[idx]
-                _RELEVANCE_CACHE[ckey] = is_rel
-                if is_rel:
-                    accepted.append(cand)
+                quality, _ = classify_candidate(target_name, title, target_details, str(details))
+                # The model can reject a listing, but cannot establish identity
+                # where deterministic evidence remains ambiguous.
+                accepted_flag = is_rel and quality in {"exact", "alternative"}
+                _RELEVANCE_CACHE[ckey] = accepted_flag
+                if accepted_flag:
+                    accepted.append({**cand, "match_quality": quality})
             else:
-                # LLM down or missing from batch -> fallback to lexical permissiveness:
-                # check if at least 1 keyword matches and no obvious conflict
-                words = [w for w in re.findall(r"[a-zA-Z0-9]+", target_name.lower()) if len(w) >= 4]
-                has_word = any(w in title.lower() for w in words)
-                _RELEVANCE_CACHE[ckey] = has_word
-                if has_word:
-                    accepted.append(cand)
+                # Failure cannot turn a borderline candidate into verified evidence.
+                _RELEVANCE_CACHE[ckey] = False
 
     logger.info(
         f"[RELEVANCE_FILTER_COMPLETED] target='{target_name}' "

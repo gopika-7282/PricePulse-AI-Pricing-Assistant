@@ -58,8 +58,9 @@ def test_competitor_pricing_omits_rag_but_keeps_structured_evidence(db):
     product, _, competitor = _product_and_competitor(db)
     rag_text = "DUPLICATED_COMPETITOR_RAG_SENTINEL " + ("long scraped detail " * 2000)
     response = {"success": True, "data": {
-        "recommended_price": 180, "competitor_summary": "Comparable listing", "confidence": 0.8,
-        "warnings": [],
+        "suggested_price": 180, "price_range_low": 160, "price_range_high": 210,
+        "rationale": "Local estimate informed by the supplied product information.",
+        "assumptions": "The pack is sold as one bottle.",
     }}
     with patch("app.services.llm_service.generate_structured", return_value=response) as generate:
         result = strategist_node({
@@ -68,24 +69,25 @@ def test_competitor_pricing_omits_rag_but_keeps_structured_evidence(db):
             "marketplace_statuses": {"Myntra": "SUCCESS"},
         })
 
-    prompt = generate.call_args.args[0]
+    prompt = generate.call_args.kwargs["prompt"]
+    from app.config import OLLAMA_MODEL
+    assert generate.call_args.kwargs["model"] == OLLAMA_MODEL
+    assert generate.call_args.kwargs["operation"] == "pricing_fallback"
     context = _prompt_context(prompt)
     assert "DUPLICATED_COMPETITOR_RAG_SENTINEL" not in prompt
     assert "rag_context" not in context
-    assert len(context["competitors"]) == 1
-    evidence = context["competitors"][0]
+    assert len(context["validated_market_evidence"]["offers"]) == 1
+    evidence = context["validated_market_evidence"]["offers"][0]
     assert evidence["marketplace"] == "Myntra"
-    assert evidence["name"] == competitor.product_name
+    assert evidence["product_name"] == competitor.product_name
     assert evidence["product_url"] == competitor.product_url
-    assert evidence["price"] == 300
-    assert evidence["price_at_target_pack_size"] == 150
-    assert evidence["quantity_value"] == 200
-    assert evidence["quantity_unit"] == "ml"
+    assert evidence["listed_price"] == 300
+    assert evidence["price"] == 150
+    assert evidence["pack_quantity"] == 200
+    assert evidence["pack_unit"] == "ml"
     assert evidence["pack_count"] == 1
-    assert evidence["same_pack"] is False
-    assert evidence["rating"] == 4.6
-    assert evidence["availability"] is True
-    assert result["strategy"]["recommended_price"] >= 120
+    assert result["strategy"]["recommended_price"] == 180
+    assert result["strategy"]["pricing_method"] == "market_data_plus_local_ai"
 
 
 def test_no_competitors_and_unavailable_rag_use_safe_estimate_fallback(db):
@@ -103,10 +105,27 @@ def test_no_competitors_and_unavailable_rag_use_safe_estimate_fallback(db):
         })
 
     context = _prompt_context(observed["prompt"])
-    assert context["relevant_pricing_context"] == "No relevant stored pricing context was retrieved."
-    assert result["strategy"]["recommended_price"] >= 120
-    assert result["strategy"]["evidence_type"] == "LLM_ESTIMATE"
+    assert context["relevant_pricing_context"] == "No RAG market context is asserted; only validated marketplace observations above are market evidence."
+    assert result["strategy"]["recommended_price"] is None
+    assert result["strategy"]["minimum_viable_price"] == 120
+    assert result["strategy"]["evidence_type"] == "ESTIMATION_UNAVAILABLE"
+    assert result["strategy"]["estimation_status"] == "unavailable"
     assert result["workflow"][-1] == {"step": "STRATEGIST", "status": "COMPLETED"}
+
+
+def test_contradictory_local_estimate_is_not_presented_as_a_recommendation(db, monkeypatch):
+    product, _, _ = _product_and_competitor(db)
+    monkeypatch.setattr("app.services.llm_service.generate_structured", lambda **kwargs: {
+        "success": True, "data": {"suggested_price": 180, "price_range_low": 220,
+                                   "price_range_high": 210, "rationale": "contradictory"},
+    })
+    result = strategist_node({
+        "db": db, "retailer_product_id": product.id, "competitors": [],
+        "evidence_type": "NO_EVIDENCE", "marketplace_statuses": {"Amazon": "BLOCKED"},
+    })
+    assert result["strategy"]["recommended_price"] is None
+    assert result["strategy"]["estimation_status"] == "unavailable"
+    assert result["strategy"]["minimum_viable_price"] == 120
 
 
 def test_rag_node_still_retrieves_and_returns_context_for_other_consumers(db):

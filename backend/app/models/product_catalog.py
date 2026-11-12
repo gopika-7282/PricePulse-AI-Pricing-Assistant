@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, DateTime, JSON
+from sqlalchemy import Column, Integer, String, Text, DateTime, JSON, Sequence, text
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship, validates
 from sqlalchemy import event
@@ -7,7 +7,7 @@ from app.database import Base
 class ProductCatalog(Base):
     __tablename__ = "product_catalog"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, Sequence("product_catalog_id_seq"), primary_key=True)
     name = Column(String, index=True, nullable=False)
     category = Column(String, index=True, nullable=True)
     brand = Column(String, index=True, nullable=True)
@@ -15,8 +15,18 @@ class ProductCatalog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
     last_scraped_at = Column(DateTime(timezone=True), nullable=True)
-    scraping_status = Column(String, default="NEVER_SCRAPED", nullable=False)
-    marketplace_statuses = Column(JSON, default=dict, nullable=False)
+    scraping_status = Column(
+        String,
+        default="NEVER_SCRAPED",
+        server_default=text("'NEVER_SCRAPED'"),
+        nullable=False,
+    )
+    marketplace_statuses = Column(
+        JSON,
+        default=dict,
+        server_default=text("'{}'"),
+        nullable=False,
+    )
 
     retailer_products = relationship("RetailerProduct", back_populates="catalog_product", cascade="all, delete-orphan")
     competitor_products = relationship("CompetitorProduct", back_populates="catalog_product", cascade="all, delete-orphan")

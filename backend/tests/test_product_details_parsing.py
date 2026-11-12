@@ -312,6 +312,7 @@ class TestValidatorPreservesDetails:
             "price": 999.0,
             "rating": 4.0,
             "availability": True,
+            "scraped_at": "2025-01-01T00:00:00+00:00",
         }
         result = validate_scraped_product(raw)
         assert result is not None

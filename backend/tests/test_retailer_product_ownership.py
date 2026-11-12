@@ -146,9 +146,11 @@ def test_business_reasoning_uses_prices_ratings_and_only_sufficient_recent_trend
     from app.routes.workflow import _business_reasoning
 
     a_user, _, catalog, a, _ = setup_shared_product(db)
+    a.quantity_value = 100
+    a.quantity_unit = "ml"
     recent = datetime.now(timezone.utc)
-    first = CompetitorProduct(catalog_product_id=catalog.id, platform_name="Amazon", product_name="Oil A", price=160, rating=4.2, scraped_at=recent)
-    second = CompetitorProduct(catalog_product_id=catalog.id, platform_name="Flipkart", product_name="Oil B", price=185, rating=None, scraped_at=recent)
+    first = CompetitorProduct(catalog_product_id=catalog.id, platform_name="Amazon", product_name="Hibiscus Hair Oil A", price=160, rating=4.2, quantity_value=100, quantity_unit="ml", scraped_at=recent)
+    second = CompetitorProduct(catalog_product_id=catalog.id, platform_name="Flipkart", product_name="Hibiscus Hair Oil B", price=185, rating=None, quantity_value=100, quantity_unit="ml", scraped_at=recent)
     db.add_all([first, second]); db.flush()
     db.add_all([
         CompetitorPriceHistory(competitor_product_id=first.id, price=150, scraped_at=recent.replace(day=max(1, recent.day - 1))),
@@ -159,7 +161,7 @@ def test_business_reasoning_uses_prices_ratings_and_only_sufficient_recent_trend
     rec = Recommendation(retailer_product_id=a.id, recommended_price=170, expected_profit=50, profit_percentage=50, reasoning="internal", evidence_type="LIVE")
     points = _business_reasoning(db, a, rec, [first, second])
     assert len(points) <= 4
-    assert any("₹160.00–₹185.00" in point for point in points)
+    assert any("typical range ₹166.25–₹178.75" in point for point in points)
     assert any("stars" in point and "4.2" in point for point in points)
     assert any("moved up" in point for point in points)
     assert all("LIVE" not in point and "evidence_type" not in point for point in points)
@@ -169,14 +171,16 @@ def test_recommendation_list_returns_only_owner_with_grounded_business_reasoning
     from app.routes.recommendation import get_recommendations
 
     a_user, _, catalog, a, b = setup_shared_product(db)
+    a.quantity_value = 100
+    a.quantity_unit = "ml"
     rec_a = Recommendation(retailer_product_id=a.id, recommended_price=170, expected_profit=70, profit_percentage=70, reasoning="stored summary", evidence_type="LIVE")
     rec_b = Recommendation(retailer_product_id=b.id, recommended_price=190, expected_profit=70, profit_percentage=58, reasoning="private summary", evidence_type="LIVE")
-    comp = CompetitorProduct(catalog_product_id=catalog.id, platform_name="Amazon", product_name="Comparable oil", price=160, rating=4.1)
+    comp = CompetitorProduct(catalog_product_id=catalog.id, platform_name="Amazon", product_name="Comparable Hibiscus Hair Oil", price=160, rating=4.1, quantity_value=100, quantity_unit="ml")
     db.add_all([rec_a, rec_b, comp]); db.commit()
     results = get_recommendations(db, a_user)
     assert [item["retailer_product_id"] for item in results] == [a.id]
     assert len(results[0]["reasoning_points"]) <= 4
-    assert any("₹160.00–₹160.00" in point for point in results[0]["reasoning_points"])
+    assert any("median reference of ₹160.00" in point for point in results[0]["reasoning_points"])
 
 
 def test_marketplace_business_display_uses_safe_missing_value_labels_and_valid_equivalents(db):

@@ -291,7 +291,8 @@ def test_chat_routes_current_competitor_question_to_fresh_timestamped_evidence(d
     user, product = user_and_product(db, "fresh-market")
     listing = CompetitorProduct(catalog_product_id=product.catalog_product_id, platform_name="Amazon",
                                 product_name="Comparable hair oil", price=175, availability=True,
-                                scraped_at=datetime.now(timezone.utc) - timedelta(days=1))
+                                scraped_at=datetime.now(timezone.utc) - timedelta(days=1),
+                                observation_source="SCRAPE")
     db.add(listing)
     db.commit()
     observed = {}
@@ -314,7 +315,8 @@ def test_chat_does_not_call_stale_competitor_row_current(db):
     user, product = user_and_product(db, "stale-market")
     db.add(CompetitorProduct(catalog_product_id=product.catalog_product_id, platform_name="Flipkart",
                              product_name="Old listing", price=150, availability=True,
-                             scraped_at=datetime.now(timezone.utc) - timedelta(days=30)))
+                             scraped_at=datetime.now(timezone.utc) - timedelta(days=30),
+                             observation_source="SCRAPE"))
     db.commit()
     evidence = build_market_evidence(db, product.catalog_product_id, "MARKET_ANALYSIS")
     assert "No marketplace listing is fresh enough" in evidence
@@ -327,12 +329,13 @@ def test_historical_evidence_uses_persisted_observations_and_requires_repetition
     user, product = user_and_product(db, "history-market")
     listing = CompetitorProduct(catalog_product_id=product.catalog_product_id, platform_name="Meesho",
                                 product_name="Comparable oil", price=160, availability=True,
-                                scraped_at=datetime.now(timezone.utc) - timedelta(days=20))
+                                scraped_at=datetime.now(timezone.utc) - timedelta(days=20),
+                                observation_source="SCRAPE")
     db.add(listing)
     db.flush()
     now = datetime.now(timezone.utc)
-    db.add_all([CompetitorPriceHistory(competitor_product_id=listing.id, price=150, scraped_at=now-timedelta(days=10)),
-                CompetitorPriceHistory(competitor_product_id=listing.id, price=160, scraped_at=now-timedelta(days=2))])
+    db.add_all([CompetitorPriceHistory(competitor_product_id=listing.id, price=150, scraped_at=now-timedelta(days=10), observation_source="SCRAPE"),
+                CompetitorPriceHistory(competitor_product_id=listing.id, price=160, scraped_at=now-timedelta(days=2), observation_source="SCRAPE")])
     db.commit()
     evidence = build_market_evidence(db, product.catalog_product_id, "HISTORICAL_TREND")
     assert "Historical observations in the last 90 days: 2 across 1 listings" in evidence

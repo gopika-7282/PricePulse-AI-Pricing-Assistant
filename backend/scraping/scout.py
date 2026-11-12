@@ -27,6 +27,8 @@ from scraping.meesho_scraper import MeeshoScraper
 from scraping.validator import validate_products
 from app.services.competitor_service import normalize_competitor_url
 from app.services.relevance_filter_service import filter_candidate_products
+from app.config import (SCRAPER_AMAZON_ENABLED, SCRAPER_FLIPKART_ENABLED,
+                        SCRAPER_MEESHO_ENABLED, SCRAPER_MYNTRA_ENABLED)
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +62,7 @@ def process_platform_pipeline(
     target_category: Optional[str],
     raw_products: List[Dict[str, Any]],
     max_products: int = 10,
+    target_details: str = "",
 ) -> Tuple[List[Dict[str, Any]], Dict[str, int]]:
     """
     Run the extraction post-processing pipeline:
@@ -87,6 +90,7 @@ def process_platform_pipeline(
         target_name=target_name,
         target_category=target_category or "",
         candidates=deduped,
+        target_details=target_details,
     )
     relevant_count = len(relevant)
 
@@ -164,6 +168,7 @@ class ScoutScraper:
                 target_category=category,
                 raw_products=raw_prods,
                 max_products=max_products,
+                target_details=product_details or "",
             )
 
             final_status = "SUCCESS" if valid_prods else "EMPTY"
@@ -221,6 +226,7 @@ class ScoutScraper:
                 target_category=category,
                 raw_products=raw_prods,
                 max_products=max_products,
+                target_details=product_details or "",
             )
 
             final_status = "SUCCESS" if valid_prods else "EMPTY"
@@ -284,17 +290,14 @@ class ScoutScraper:
             "Amazon": self._run_amazon,
             "Flipkart": self._run_flipkart,
         }
-        selected = list(runners) if platforms is None else [
+        enabled = {"Amazon": SCRAPER_AMAZON_ENABLED, "Flipkart": SCRAPER_FLIPKART_ENABLED,
+                   "Myntra": SCRAPER_MYNTRA_ENABLED, "Meesho": SCRAPER_MEESHO_ENABLED}
+        selected = [name for name in runners if enabled[name]] if platforms is None else [
             name for name in runners if any(str(requested).casefold() == name.casefold() for requested in platforms)
         ]
         results = {}
         for platform in selected:
             results[platform] = await safely_run(platform, runners[platform])
-            # Honor the user's requested fallback order and stop once a
-            # marketplace supplies normalized products. If callers explicitly
-            # select multiple platforms for comparison, collect each selection.
-            if platforms is None and results[platform].get("products"):
-                break
         return results
 
     async def _run_additional_platform(self, scraper, platform, method_name, product_name, category, product_details, limit):
@@ -305,7 +308,8 @@ class ScoutScraper:
                 status = "PARSE_ERROR"
             products = result.get("products", []) if status == "SUCCESS" else []
             if status == "SUCCESS":
-                products, _ = process_platform_pipeline(platform, product_name, category, products, limit)
+                products, _ = process_platform_pipeline(platform, product_name, category, products, limit,
+                                                        target_details=product_details or "")
                 status = "SUCCESS" if products else "EMPTY"
             scraper.log_diagnostic(platform, "normalization", final_status=status,
                                    reason_category=scraper.result_reason_category(status),

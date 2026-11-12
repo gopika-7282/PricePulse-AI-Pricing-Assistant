@@ -31,7 +31,7 @@ async def test_scout_runs_requested_marketplace_only(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_scout_default_fallback_order_stops_after_first_success(monkeypatch):
+async def test_scout_attempts_every_configured_marketplace_after_success(monkeypatch):
     scout = ScoutScraper(max_retries=0)
     called = []
 
@@ -46,13 +46,19 @@ async def test_scout_default_fallback_order_stops_after_first_success(monkeypatc
 
     for platform, attribute in (("Myntra", "_run_myntra"), ("Meesho", "_run_meesho"),
                                 ("Amazon", "_run_amazon"), ("Flipkart", "_run_flipkart")):
-        monkeypatch.setattr(scout, attribute, await success(platform))
+        if platform == "Myntra":
+            async def failure(*args, **kwargs):
+                called.append("Myntra")
+                return {"platform": "Myntra", "status": "BLOCKED", "products": []}
+            monkeypatch.setattr(scout, attribute, failure)
+        else:
+            monkeypatch.setattr(scout, attribute, await success(platform))
 
     result = await asyncio.wait_for(scout.get_platform_statuses("hibiscus hair oil", max_products=1), timeout=2)
 
-    assert called == ["Myntra"]
-    assert result["platform_statuses"] == {"Myntra": "SUCCESS"}
-    assert result["total_products"] == 1
+    assert called == ["Myntra", "Meesho", "Amazon", "Flipkart"]
+    assert result["platform_statuses"] == {"Myntra": "BLOCKED", "Meesho": "SUCCESS", "Amazon": "SUCCESS", "Flipkart": "SUCCESS"}
+    assert result["total_products"] == 3
 
 
 def test_navigation_failure_message_keeps_the_underlying_exception():

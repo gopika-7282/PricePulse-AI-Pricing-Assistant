@@ -11,6 +11,7 @@ __pycache__/
 # =====================
 .env
 .env.*
+!.env.example
 
 # =====================
 # Frontend (React/Node)
@@ -44,6 +45,12 @@ logs/
 # Vector Database (RAG)
 # =====================
 chroma_db/
+chroma_data/
+uploads/
+tmp/
+temp/
+test-results/
+.venv/
 
 # =====================
 # Database Files

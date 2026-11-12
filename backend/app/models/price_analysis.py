@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, Text, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, Float, Text, ForeignKey, DateTime, Sequence, text
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -7,12 +7,12 @@ from app.database import Base
 class PriceAnalysis(Base):
     __tablename__ = "price_analysis"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, Sequence("price_analysis_id_seq"), primary_key=True)
     retailer_product_id = Column(Integer, ForeignKey("retailer_products.id", ondelete="CASCADE"), nullable=False, index=True)
     average_market_price = Column(Float, nullable=True)
     minimum_market_price = Column(Float, nullable=True)
     maximum_market_price = Column(Float, nullable=True)
-    competitor_count = Column(Integer, default=0)
+    competitor_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
     price_difference_percentage = Column(Float, nullable=True)
     analysis_summary = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)

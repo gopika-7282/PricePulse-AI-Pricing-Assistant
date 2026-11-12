@@ -28,6 +28,15 @@ def db():
     engine.dispose()
 
 
+@pytest.fixture(autouse=True)
+def local_estimate_stub(monkeypatch):
+    monkeypatch.setattr("app.services.llm_service.generate_structured", lambda **kwargs: {
+        "success": True, "data": {"suggested_price": 110, "price_range_low": 100,
+                                   "price_range_high": 130, "rationale": "Local estimate for test.",
+                                   "assumptions": "Single retail pack."},
+    })
+
+
 def make_product(db, created_days_ago=0):
     user = User(email=f"evidence-{datetime.now().timestamp()}@example.com", retailer_name="Test", password_hash="not-a-secret")
     db.add(user)
@@ -42,7 +51,10 @@ def make_product(db, created_days_ago=0):
 
 
 def add_competitor(db, catalog_id, platform, price, days_old):
-    row = CompetitorProduct(catalog_product_id=catalog_id, platform_name=platform, product_name=f"{platform} hair oil", price=price, availability=True, scraped_at=datetime.now(timezone.utc) - timedelta(days=days_old))
+    row = CompetitorProduct(catalog_product_id=catalog_id, platform_name=platform,
+                            product_name=f"{platform} hair oil", price=price, availability=True,
+                            scraped_at=datetime.now(timezone.utc) - timedelta(days=days_old),
+                            observation_source="SCRAPE")
     db.add(row)
     db.flush()
     return row
@@ -57,12 +69,12 @@ def test_freshness_uses_latest_competitor_observation_not_catalog_age(db):
     assert result["age_days"] < 2
 
 
-def test_fresh_competitor_data_routes_around_scraping(db):
+def test_fresh_competitor_data_still_routes_through_scraping(db):
     catalog, _ = make_product(db, created_days_ago=90)
     add_competitor(db, catalog.id, "Amazon", 250, 1)
     state = freshness_node({"db": db, "catalog_id": catalog.id, "workflow": []})
     assert state["fresh"] is True
-    assert route_freshness(state) == "rag"
+    assert route_freshness(state) == "scout"
     assert state["evidence_type"] == "LIVE"
 
 
@@ -72,7 +84,7 @@ def test_stale_data_with_partial_live_success_uses_only_new_successful_rows(db):
 
     def scrape(_db, product):
         product.marketplace_statuses = {"Amazon": "BLOCKED", "Flipkart": "OK", "Myntra": "TIMEOUT", "Meesho": "NETWORK_ERROR"}
-        _db.add(CompetitorProduct(catalog_product_id=catalog.id, platform_name="Flipkart", product_name="New matching listing", price=240, availability=True, scraped_at=datetime.now(timezone.utc)))
+        _db.add(CompetitorProduct(catalog_product_id=catalog.id, platform_name="Flipkart", product_name="New matching listing", price=240, availability=True, scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE"))
         _db.commit()
 
     with patch("app.services.scraping_service.scrape_product", side_effect=scrape):
@@ -96,11 +108,11 @@ def test_stale_data_and_no_live_results_falls_back_to_history(db):
         result = scout_node({"db": db, "catalog_id": catalog.id, "workflow": []})
     assert result["evidence_type"] == "STALE_FALLBACK"
     assert set(result["competitors"]) == {old_amazon, old_flipkart}
-    with patch("app.services.llm_service.generate_structured", return_value={"success": True, "data": {"recommended_price": 250, "confidence": 0.9, "warnings": []}}):
-        strategy = strategist_node({"db": db, "retailer_product_id": retailer.id, **result})
-    assert strategy["evidence_type"] == "STALE_FALLBACK"
-    assert strategy["strategy"]["confidence"] <= 0.55
+    strategy = strategist_node({"db": db, "retailer_product_id": retailer.id, **result})
+    assert strategy["evidence_type"] == "LLM_ESTIMATE"
+    assert strategy["strategy"]["confidence"] == 0.35
     assert "Live marketplace prices were unavailable" in strategy["strategy"]["reasoning_summary"]
+    assert "Local AI estimate — no sufficient live market data" in strategy["strategy"]["reasoning_summary"]
 
 
 def test_new_product_with_live_competitor_data_is_live_evidence(db):
@@ -108,7 +120,7 @@ def test_new_product_with_live_competitor_data_is_live_evidence(db):
 
     def scrape(_db, product):
         product.marketplace_statuses = {"Amazon": "OK", "Flipkart": "BLOCKED", "Myntra": "EMPTY", "Meesho": "TIMEOUT"}
-        _db.add(CompetitorProduct(catalog_product_id=catalog.id, platform_name="Amazon", product_name="Verified similar oil", price=240, availability=True, scraped_at=datetime.now(timezone.utc)))
+        _db.add(CompetitorProduct(catalog_product_id=catalog.id, platform_name="Amazon", product_name="Verified similar oil", price=240, availability=True, scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE"))
         _db.commit()
 
     with patch("app.services.scraping_service.scrape_product", side_effect=scrape):
@@ -127,18 +139,10 @@ def test_stale_history_from_one_marketplace_is_not_enough_to_recommend(db):
     with patch("app.services.scraping_service.scrape_product", side_effect=scrape):
         result = scout_node({"db": db, "catalog_id": catalog.id, "workflow": []})
     assert result["evidence_type"] == "STALE_FALLBACK"
-    fallback_estimate = {"success": True, "data": {
-        "estimated_price": 145, "price_range_low": 130, "price_range_high": 180,
-        "confidence": 0.4, "reasoning": "Uses product cost and related pricing context.", "evidence_type": "LLM_ESTIMATE",
-    }}
-    with patch("app.services.llm_service.generate_structured", return_value=fallback_estimate) as estimate:
-        strategy = strategist_node({"db": db, "retailer_product_id": retailer.id, **result})
-    estimate.assert_called_once()
-    from app.config import OLLAMA_STRATEGIST_TIMEOUT
-    assert estimate.call_args.kwargs["timeout"] == OLLAMA_STRATEGIST_TIMEOUT
-    assert estimate.call_args.kwargs["operation"] == "strategist_estimate"
+    strategy = strategist_node({"db": db, "retailer_product_id": retailer.id, **result})
     assert strategy["evidence_type"] == "LLM_ESTIMATE"
-    assert strategy["strategy"]["recommended_price"] >= 120
+    assert strategy["strategy"]["recommended_price"] == 120
+    assert strategy["strategy"]["confidence"] == 0.35
 
 
 def test_product_write_stages_catalog_and_langgraph_selects_final_identity(db):
@@ -153,18 +157,14 @@ def test_estimate_is_margin_safe_persisted_as_recommendation_only(db):
     catalog, retailer = make_product(db)
     retailer.cost_price = 100.01
     db.flush()
-    estimate_response = {"success": True, "data": {
-        "estimated_price": 105, "price_range_low": 95, "price_range_high": 125,
-        "confidence": 0.55, "reasoning": "Based on the product category and cost basis.", "evidence_type": "LLM_ESTIMATE",
-    }}
-    with patch("app.services.llm_service.generate_structured", return_value=estimate_response):
-        result = strategist_node({"db": db, "retailer_product_id": retailer.id, "competitors": [], "evidence_type": "NO_EVIDENCE"})
+    result = strategist_node({"db": db, "retailer_product_id": retailer.id, "competitors": [], "evidence_type": "NO_EVIDENCE"})
     strategy = result["strategy"]
     assert result["evidence_type"] == "LLM_ESTIMATE"
-    assert strategy["recommended_price"] >= 120.012
-    assert strategy["price_range_low"] >= 120.012
+    assert strategy["recommended_price"] == 120.02
+    assert strategy["price_range_low"] == 120.02
+    assert strategy["price_range_high"] == 130
     assert strategy["price_range_low"] <= strategy["recommended_price"] <= strategy["price_range_high"]
-    assert strategy["confidence"] <= 0.60
+    assert strategy["confidence"] == 0.35
     checked = compliance_node({"db": db, "retailer_product_id": retailer.id, "competitors": [], "strategy": strategy, "evidence_type": "LLM_ESTIMATE"})
     assert checked["compliance"]["accepted"] is True
     persisted = persistence_node({"db": db, "retailer_product_id": retailer.id, "competitors": [], "strategy": strategy, "evidence_type": "LLM_ESTIMATE", **checked})
@@ -239,7 +239,7 @@ def test_estimate_reasoning_does_not_claim_missing_market_evidence(db):
     assert "competitor" not in all_points
     assert "rating" not in all_points
     assert "trend" not in all_points
-    assert "minimum profitable price" in all_points
+    assert "minimum profitable selling price" in all_points
 
 
 def test_saved_quantity_aware_recommendation_is_returned_by_workflow_api(db):
@@ -254,9 +254,9 @@ def test_saved_quantity_aware_recommendation_is_returned_by_workflow_api(db):
         evidence_type="LIVE", accepted_by_user=False,
     )
     competitor = CompetitorProduct(catalog_product_id=catalog.id, platform_name="Amazon",
-        product_name="Comparable 100 g hair oil", price=300, quantity_value=100,
+        product_name="Comparable Hibiscus Hair Oil 100 g", price=300, quantity_value=100,
         quantity_unit="g", pack_count=1, total_quantity=100, total_quantity_unit="g",
-        availability=True)
+        availability=True, scraped_at=datetime.now(timezone.utc), observation_source="SCRAPE")
     db.add_all([recommendation, competitor]); db.commit(); db.refresh(recommendation)
     payload = _analysis_response(db, retailer, {
         "recommendation": recommendation, "competitors": [competitor], "evidence_type": "LIVE",
@@ -267,20 +267,26 @@ def test_saved_quantity_aware_recommendation_is_returned_by_workflow_api(db):
     assert payload["recommended_price_min"] == 154
     assert payload["recommended_price_max"] == 161
     assert payload["basis"] == "MARKET_DATA"
-    assert any("Comparable listings" in point and "₹150" in point for point in payload["reasoning"])
+    assert payload["cost_price"] == 100
+    assert payload["minimum_profitable_selling_price"] == 120
+    assert payload["gross_profit_per_unit"] == 54
+    assert payload["markup_on_cost_percent"] == 54
+    assert payload["gross_margin_percent"] == pytest.approx(35.06)
+    # Legacy profit_percentage stores markup; actual_margin_percent is gross margin.
+    assert payload["actual_margin_percent"] == pytest.approx(35.06)
+    assert payload["margin_headroom_percent"] == 34
+    assert any("median reference of ₹150" in point and "typical range" in point for point in payload["reasoning"])
 
 
-def test_unavailable_estimator_returns_cost_based_starting_price(db):
+def test_unavailable_estimator_does_not_present_cost_floor_as_recommendation(db):
     _, retailer = make_product(db)
     with patch("app.services.llm_service.generate_structured", return_value={"success": False, "data": None}):
         result = strategist_node({"db": db, "retailer_product_id": retailer.id, "competitors": [], "evidence_type": "NO_EVIDENCE"})
-    assert result["evidence_type"] == "LLM_ESTIMATE"
-    assert result["strategy"]["recommended_price"] > 0
-    assert result["strategy"]["price_range_low"] <= result["strategy"]["recommended_price"] <= result["strategy"]["price_range_high"]
-    assert "provisional" in result["strategy"]["reasoning_summary"]
+    assert result["evidence_type"] == "ESTIMATION_UNAVAILABLE"
+    assert result["strategy"]["recommended_price"] is None
+    assert result["strategy"]["price_range_low"] is None
+    assert result["strategy"]["minimum_viable_price"] == 120
+    assert result["strategy"]["estimation_status"] == "unavailable"
     persisted = compliance_node({"db": db, "retailer_product_id": retailer.id, "competitors": [], "strategy": result["strategy"], "evidence_type": result["evidence_type"]})
-    assert persisted["compliance"]["accepted"]
-    result.update({"db": db, "retailer_product_id": retailer.id, **persisted})
-    saved = persistence_node(result)
-    assert saved["recommendation"].recommended_price > 0
-    assert db.query(Recommendation).count() == 1
+    assert persisted["compliance"]["accepted"] is False
+    assert db.query(Recommendation).count() == 0

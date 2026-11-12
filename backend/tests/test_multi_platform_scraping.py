@@ -325,6 +325,11 @@ class TestNormalizedOutput:
         assert len(validated) == 1
         assert validated[0]["availability"] is None
 
+    def test_missing_observation_timestamp_is_rejected_without_fallback(self):
+        product = _make_product("Amazon")
+        product.pop("scraped_at")
+        assert validate_products([product]) == []
+
     def test_blocked_sentinel_skipped(self):
         """Blocked sentinel dicts are silently skipped during validation."""
         items = [
@@ -682,12 +687,12 @@ class TestSpecificProducts:
     @pytest.mark.asyncio
     async def test_hibiscus_hair_oil_mock_full_scrape(self):
         """
-        Mock scrape for Hibiscus Hair Oil follows the preferred fallback order.
+        Mock scrape for Hibiscus Hair Oil attempts all enabled marketplaces.
         Verifies:
         - Myntra is attempted first
-        - The fallback stops after the first successful normalized result
+        - Remaining enabled marketplaces are attempted after a successful result
         - Results have correct platform names
-        - Results count is <= 10
+        - Each marketplace result stays within the per-platform cap
         - No hardcoded product titles
         """
         scout = ScoutScraper()
@@ -723,16 +728,22 @@ class TestSpecificProducts:
                 product_details="Natural herbal hair oil with hibiscus extract",
             )
 
-        # Preferred marketplace succeeded, so no fallback was attempted.
+        # Results from all enabled marketplaces are gathered in configured order.
         assert result["platform_statuses"]["Myntra"] == "SUCCESS"
-        assert called == ["Myntra"]
-        assert result["total_products"] == 5
+        assert called == ["Myntra", "Meesho", "Amazon", "Flipkart"]
+        assert result["platform_statuses"] == {
+            "Myntra": "SUCCESS", "Meesho": "SUCCESS",
+            "Amazon": "BLOCKED", "Flipkart": "SUCCESS",
+        }
+        assert result["total_products"] == 21
 
         # The successful products retain their platform identity.
         platforms_found = {p["platform"] for p in result["products"]}
-        assert platforms_found == {"Myntra"}
+        assert platforms_found == {"Myntra", "Meesho", "Flipkart"}
 
-        assert len(result["products"]) <= 10
+        assert len(result["sequential_results"]["Myntra"]["products"]) <= 10
+        assert len(result["sequential_results"]["Meesho"]["products"]) <= 10
+        assert len(result["sequential_results"]["Flipkart"]["products"]) <= 10
 
 
 # ===========================================================================
@@ -777,7 +788,8 @@ class TestFlipkartBackwardCompat:
             products = await scout.get_competitor_data("Test Product")
 
         assert isinstance(products, list), "get_competitor_data must return a list"
-        assert len(products) == 1  # preferred Myntra result ends the fallback chain
+        assert len(products) == 10  # results from all four enabled marketplaces
+        assert {p["platform"] for p in products} == {"Myntra", "Meesho", "Amazon", "Flipkart"}
         # All have required fields
         for p in products:
             assert "platform" in p

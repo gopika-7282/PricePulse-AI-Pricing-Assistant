@@ -13,6 +13,7 @@ class RecommendationResponse(BaseModel):
     reasoning: str
     confidence_score: Optional[float] = None
     evidence_type: str = "NO_EVIDENCE"
+    pricing_method: str = "local_ai_estimate"
     basis: str = "ESTIMATE"
     reasoning_points: List[str] = Field(default_factory=list, max_length=4)
     accepted_by_user: Optional[bool] = None
@@ -22,5 +23,13 @@ class RecommendationResponse(BaseModel):
 
     @model_validator(mode="after")
     def classify_basis(self):
+        if self.evidence_type in {"LIVE", "STALE_FALLBACK"}:
+            self.pricing_method = "market_data_backed"
+        elif self.reasoning.strip().startswith("Market data + local AI estimate"):
+            self.pricing_method = "market_data_plus_local_ai"
+        elif self.evidence_type == "PROVISIONAL":
+            self.pricing_method = "market_data_backed"
+        else:
+            self.pricing_method = "local_ai_estimate"
         self.basis = "MARKET_DATA" if self.evidence_type in {"LIVE", "STALE_FALLBACK"} else "ESTIMATE"
         return self

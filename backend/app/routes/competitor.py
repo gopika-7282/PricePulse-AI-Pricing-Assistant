@@ -8,7 +8,7 @@ from app.models.retailer_product import RetailerProduct
 from app.models.competitor_product import CompetitorProduct
 
 from app.services.competitor_service import (
-    upsert_competitor_product, get_all_competitor_products,
+    upsert_competitor_product, create_manual_competitor_product, get_all_competitor_products,
     get_competitor_product_by_id, save_price_history, get_competitor_price_history
 )
 from app.schemas.competitor_product import CompetitorProductCreate, CompetitorProductResponse
@@ -25,7 +25,7 @@ def create_competitor(
     if not db.query(RetailerProduct).filter_by(user_id=current_user.id, catalog_product_id=request.catalog_product_id).first():
         raise HTTPException(status_code=404, detail="Product not found")
     try:
-        return upsert_competitor_product(
+        return create_manual_competitor_product(
             db=db,
             catalog_product_id=request.catalog_product_id,
             platform_name=request.platform_name,
@@ -34,7 +34,7 @@ def create_competitor(
             product_url=request.product_url,
             product_details=request.product_details,
             rating=request.rating,
-            availability=request.availability
+            availability=request.availability,
         )
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid competitor data provided")
@@ -61,7 +61,8 @@ def add_price_history(
     if not owned:
         raise HTTPException(status_code=404, detail="Competitor not found")
     try:
-        return save_price_history(db, request.competitor_product_id, request.price)
+        return save_price_history(db, request.competitor_product_id, request.price,
+                                  request.observed_at, "MANUAL")
     except Exception:
         raise HTTPException(status_code=400, detail="Failed to save price history")
 

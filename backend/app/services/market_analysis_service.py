@@ -27,7 +27,11 @@ def build_market_evidence(db, catalog_product_id: int | None, intent: str | None
                 "No product or resolved category is selected for a comparable marketplace lookup, so no current or historical marketplace claim can be made.")
 
     now = now or datetime.now(timezone.utc)
-    competitors = db.query(CompetitorProduct).filter_by(catalog_product_id=catalog_product_id).all()
+    competitors = db.query(CompetitorProduct).filter(
+        CompetitorProduct.catalog_product_id == catalog_product_id,
+        CompetitorProduct.observation_source == "SCRAPE",
+        CompetitorProduct.scraped_at.isnot(None),
+    ).all()
     fresh_cutoff = now - timedelta(days=SCRAPE_FRESHNESS_THRESHOLD_DAYS)
     fresh = []
     for row in competitors:
@@ -62,6 +66,7 @@ def build_market_evidence(db, catalog_product_id: int | None, intent: str | None
         period_label = f"last {period_days} days"
     observations = (db.query(CompetitorPriceHistory)
                     .filter(CompetitorPriceHistory.competitor_product_id.in_(ids))
+                    .filter(CompetitorPriceHistory.observation_source == "SCRAPE")
                     .filter(CompetitorPriceHistory.scraped_at >= start)
                     .filter(CompetitorPriceHistory.scraped_at <= now)
                     .order_by(CompetitorPriceHistory.scraped_at.asc()).all()) if ids else []

@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, Float, ForeignKey, DateTime, String, Text, Boolean, text
+from sqlalchemy import Column, Integer, Float, ForeignKey, DateTime, String, Text, Boolean, Sequence, text
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -7,11 +7,11 @@ from app.database import Base
 class RetailerProduct(Base):
     __tablename__ = "retailer_products"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, Sequence("retailer_products_id_seq"), primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
     catalog_product_id = Column(Integer, ForeignKey("product_catalog.id", ondelete="CASCADE"), nullable=False, index=True)
     cost_price = Column(Float, nullable=False)
-    stock_quantity = Column(Integer, nullable=False, default=0)
+    stock_quantity = Column(Integer, nullable=False, default=0, server_default=text("0"))
     quantity_value = Column(Float, nullable=True)
     quantity_unit = Column(String(16), nullable=True)
     minimum_profit_margin = Column(Float, nullable=False)

@@ -1,0 +1,124 @@
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify release contents
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      startsWith(github.event.workflow_run.head_branch, 'v')
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: pricepulse_test
+          POSTGRES_USER: pricepulse_test
+          POSTGRES_PASSWORD: pricepulse_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U pricepulse_test -d pricepulse_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql+psycopg2://pricepulse_test:pricepulse_test@localhost:5432/pricepulse_test
+      SECRET_KEY: ci-only-secret-key-not-for-deployment
+      RELEASE_VERSION: ${{ github.event.workflow_run.head_branch }}
+      RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+      CHROMA_PERSIST_DIRECTORY: ${{ runner.temp }}/pricepulse-chroma-${{ github.run_id }}
+      OLLAMA_BASE_URL: http://127.0.0.1:9
+      OLLAMA_TIMEOUT: '1'
+      OLLAMA_IDENTITY_TIMEOUT: '1'
+      OLLAMA_RELEVANCE_TIMEOUT: '1'
+      OLLAMA_STRATEGIST_TIMEOUT: '1'
+    steps:
+      - uses: actions/checkout@v4.2.2
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+      - name: Confirm the successful CI ref is a version tag at this commit
+        shell: bash
+        run: |
+          if [[ ! "$RELEASE_VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release ref must be a semantic version tag (for example v1.0.0)." >&2
+            exit 1
+          fi
+          git fetch origin "refs/tags/${RELEASE_VERSION}:refs/tags/${RELEASE_VERSION}"
+          test "$(git rev-list -n 1 "${RELEASE_VERSION}")" = "${RELEASE_SHA}"
+      - uses: actions/setup-python@v5.6.0
+        with:
+          python-version: '3.10'
+          cache: pip
+          cache-dependency-path: requirements.txt
+      - uses: actions/setup-node@v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install and run backend checks
+        working-directory: backend
+        run: |
+          python -m pip install -r ../requirements.txt
+          python -c "from app.main import app; assert app.title == 'PricePulse API'"
+          alembic -c alembic.ini upgrade head
+          pytest -ra
+      - name: Build frontend and run tests
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - uses: docker/setup-buildx-action@v3.10.0
+      - name: Build backend image archive
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: .
+          file: backend/Dockerfile
+          push: false
+          tags: pricepulse-backend:${{ github.event.workflow_run.head_branch }}
+          outputs: type=docker,dest=/tmp/pricepulse-backend.tar
+      - name: Build frontend image archive
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: frontend
+          file: frontend/Dockerfile
+          push: false
+          tags: pricepulse-frontend:${{ github.event.workflow_run.head_branch }}
+          outputs: type=docker,dest=/tmp/pricepulse-frontend.tar
+      - name: Assemble versioned release bundle
+        shell: bash
+        run: |
+          mkdir -p release/frontend release/docker
+          cp -R frontend/dist/. release/frontend/
+          cp /tmp/pricepulse-backend.tar release/docker/
+          cp /tmp/pricepulse-frontend.tar release/docker/
+          cat > release/BUILD_INFO.txt <<EOF
+          version=${RELEASE_VERSION}
+          commit=${RELEASE_SHA}
+          built_at=${GITHUB_RUN_ID}
+          EOF
+          tar -czf "pricepulse-${RELEASE_VERSION}.tar.gz" release
+          sha256sum "pricepulse-${RELEASE_VERSION}.tar.gz" > "pricepulse-${RELEASE_VERSION}.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4.6.2
+        with:
+          name: pricepulse-${{ github.event.workflow_run.head_branch }}
+          path: |
+            pricepulse-${{ github.event.workflow_run.head_branch }}.tar.gz
+            pricepulse-${{ github.event.workflow_run.head_branch }}.tar.gz.sha256
+          retention-days: 90
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${RELEASE_VERSION}" "pricepulse-${RELEASE_VERSION}.tar.gz" "pricepulse-${RELEASE_VERSION}.tar.gz.sha256" --generate-notes

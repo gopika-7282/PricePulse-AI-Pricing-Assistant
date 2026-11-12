@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Text, Float, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, Text, Float, ForeignKey, DateTime, Sequence
 from sqlalchemy.sql import func
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
@@ -7,7 +7,7 @@ from app.database import Base
 class AgentLog(Base):
     __tablename__ = "agent_logs"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, Sequence("agent_logs_id_seq"), primary_key=True)
     retailer_product_id = Column(Integer, ForeignKey("retailer_products.id", ondelete="CASCADE"), nullable=False, index=True)
     agent_name = Column(String, nullable=False)
     task_description = Column(String, nullable=False)
