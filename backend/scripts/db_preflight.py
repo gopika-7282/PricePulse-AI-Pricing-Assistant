@@ -6,6 +6,7 @@ it does not run schema DDL.
 """
 import argparse
 import os
+import re
 import sys
 from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import make_url
@@ -82,7 +83,174 @@ VALUE_DEFAULTS = {
     ("recommendations", "evidence_type"): "'NO_EVIDENCE'",
 }
 BASELINE = "20261111_0001"
+CANONICAL_HEAD = "20261111_0002"
 EXPECTED_SEQUENCES = {f"{table}_id_seq" for table in REQUIRED}
+
+def normalize_server_default(value):
+    """Normalize PostgreSQL display casts without altering quoted SQL tokens.
+
+    Case and contents inside single-quoted string literals and double-quoted
+    identifiers are preserved. Outside those regions, type names are
+    lowercased, whitespace is collapsed, and supported PostgreSQL display
+    casts are removed.
+    """
+    if value is None:
+        return ""
+
+    source = str(value)
+    result: list[str] = []
+    quote: str | None = None
+    pending_space = False
+    i = 0
+
+    # These patterns are matched only at the current unquoted position.
+    display_cast = re.compile(
+        r"::\s*(?:character\s+varying(?:\s*\(\s*\d+\s*\))?|json\b|regclass\b)",
+        re.IGNORECASE,
+    )
+
+    while i < len(source):
+        ch = source[i]
+
+        if quote is not None:
+            result.append(ch)
+            if ch == quote:
+                # SQL escapes a quote within a quoted token by doubling it.
+                if i + 1 < len(source) and source[i + 1] == quote:
+                    result.append(source[i + 1])
+                    i += 2
+                    continue
+                quote = None
+            i += 1
+            continue
+
+        if ch.isspace():
+            pending_space = True
+            i += 1
+            continue
+
+        if source.startswith("::", i):
+            cast = display_cast.match(source, i)
+            if cast:
+                # Keep pending whitespace so a following operator remains
+                # separated where the input separated it.
+                i = cast.end()
+                continue
+
+        if pending_space and result:
+            result.append(" ")
+        pending_space = False
+
+        if ch in ("'", '"'):
+            quote = ch
+            result.append(ch)
+        else:
+            result.append(ch.lower())
+        i += 1
+
+    return "".join(result).strip()
+
+def _check_schema(inspector, reasons):
+    """Shared read-only schema checks used by both canonical verification and legacy adoption.
+
+    Populates *reasons* with any deviation from the canonical contract.
+    Does NOT perform timestamp-provenance or data checks – those belong only
+    in :func:`inspect_database` / :func:`adopt_database`.
+    """
+    app_tables = set(inspector.get_table_names()) - {"alembic_version", "canonical_alembic_version"}
+    missing_tables = set(REQUIRED) - app_tables
+    if missing_tables:
+        for t in sorted(missing_tables):
+            reasons.append(f"Required application table is missing: {t}")
+    sequence_names = set(inspector.get_sequence_names())
+    if sequence_names != EXPECTED_SEQUENCES:
+        reasons.append("Named ID sequences differ from the canonical contract")
+    for table, expected_cols in REQUIRED.items():
+        if table not in app_tables:
+            continue
+        actual = {col["name"] for col in inspector.get_columns(table)}
+        missing_cols = expected_cols - actual
+        extra_cols = actual - expected_cols
+        if missing_cols:
+            reasons.append(f"{table} missing columns: {', '.join(sorted(missing_cols))}")
+        if extra_cols:
+            reasons.append(f"{table} has unexpected columns: {', '.join(sorted(extra_cols))}")
+        for column in inspector.get_columns(table):
+            cname = column["name"]
+            expected_nullable = cname in NULLABLE_COLUMNS[table]
+            if bool(column["nullable"]) != expected_nullable:
+                reasons.append(f"{table}.{cname} nullability differs from the canonical contract")
+            default = column.get("default")
+            if cname == "id":
+                expected_default = f"nextval('{table}_id_seq'::regclass)"
+            elif cname in TIMESTAMP_DEFAULTS[table]:
+                expected_default = "now()"
+            else:
+                expected_default = VALUE_DEFAULTS.get((table, cname))
+            if normalize_server_default(default) != normalize_server_default(expected_default):
+                reasons.append(
+                    f"{table}.{cname} server default differs from the canonical contract"
+                )
+        pk_columns = list((inspector.get_pk_constraint(table) or {}).get("constrained_columns") or [])
+        if pk_columns != ["id"]:
+            reasons.append(
+                f"{table} primary key differs from the canonical contract: expected ['id'], found {pk_columns!r}"
+            )
+        indexes = {
+            index["name"] for index in inspector.get_indexes(table)
+            if set(index.get("column_names") or []) != set(pk_columns)
+        }
+        if indexes != EXPECTED_INDEXES[table]:
+            reasons.append(f"{table} indexes differ from the canonical contract")
+        actual_fks = {
+            (fk["constrained_columns"][0], fk["referred_table"], fk["referred_columns"][0],
+             str((fk.get("options") or {}).get("ondelete", "")).upper())
+            for fk in inspector.get_foreign_keys(table)
+        }
+        if actual_fks != EXPECTED_FKS[table]:
+            reasons.append(f"{table} foreign keys or delete actions differ from the canonical contract")
+
+
+def verify_canonical_database(connection):
+    """Read-only validation of a database installed via the canonical fresh-install path.
+
+    Checks:
+    * ``canonical_alembic_version`` exists and contains the expected revision.
+    * All required application tables, columns, sequences, defaults,
+      nullability, primary keys, indexes, and foreign keys match the contract.
+
+    Intentionally does NOT perform legacy timestamp-provenance checks.
+    Competitor rows legitimately marked ``'MANUAL'`` must not cause this check
+    to fail.
+    """
+    inspector = inspect(connection)
+    all_tables = set(inspector.get_table_names())
+    reasons = []
+
+    # 1. Version table must exist and carry the expected head revision.
+    if "canonical_alembic_version" not in all_tables:
+        return {
+            "state": "canonical_verification_failed",
+            "safe_to_verify": False,
+            "reasons": ["canonical_alembic_version is missing; run the canonical upgrade first"],
+        }
+    revision = connection.execute(
+        text("SELECT version_num FROM canonical_alembic_version")
+    ).scalar_one_or_none()
+    if revision != CANONICAL_HEAD:
+        reasons.append(
+            f"canonical_alembic_version is {revision!r}; expected {CANONICAL_HEAD!r}"
+        )
+
+    # 2. Shared structural schema checks (no data/provenance checks).
+    _check_schema(inspector, reasons)
+
+    return {
+        "state": "canonical",
+        "revision": CANONICAL_HEAD,
+        "safe_to_verify": not reasons,
+        "reasons": reasons,
+    }
 
 def inspect_database(connection):
     inspector = inspect(connection)
@@ -129,11 +297,11 @@ def inspect_database(connection):
                 expected_default = "now()"
             else:
                 expected_default = VALUE_DEFAULTS.get((table, column["name"]))
-            normalize = lambda value: str(value or "").lower().replace(" ", "").replace("::character varying", "").replace("::json", "").replace("::regclass", "").strip("()")
             legacy_missing_count_default = (table == "price_analysis"
                                             and column["name"] == "competitor_count"
                                             and default is None)
-            if normalize(default) != normalize(expected_default) and not legacy_missing_count_default:
+            if (normalize_server_default(default) != normalize_server_default(expected_default)
+                    and not legacy_missing_count_default):
                 reasons.append(f"{table}.{column['name']} server default differs from the canonical contract")
         pk_columns = set((inspector.get_pk_constraint(table) or {}).get("constrained_columns") or [])
         indexes = {
@@ -207,7 +375,7 @@ def backfill_and_constrain_competitor_count(connection):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("preflight", "adopt"))
+    parser.add_argument("action", choices=("preflight", "adopt", "verify-canonical"))
     parser.add_argument("--confirm-adoption", action="store_true", help="Required to write the canonical version marker")
     args = parser.parse_args()
     url = os.getenv("DATABASE_URL")
@@ -219,6 +387,10 @@ def main():
     engine = create_engine(url)
     try:
         with engine.begin() as connection:
+            if args.action == "verify-canonical":
+                result = verify_canonical_database(connection)
+                print(result)
+                return 0 if result["safe_to_verify"] else 2
             result = inspect_database(connection)
             print(result)
             if args.action == "preflight":

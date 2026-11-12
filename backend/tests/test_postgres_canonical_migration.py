@@ -8,6 +8,7 @@ from scripts.db_preflight import (
     adopt_database,
     backfill_and_constrain_competitor_count,
     inspect_database,
+    verify_canonical_database,
 )
 
 TEST_DATABASE_URL = os.getenv("PRICEPULSE_TEST_DATABASE_URL")
@@ -77,6 +78,39 @@ def test_postgres_backfill_sets_null_counts_to_zero_before_not_null():
                 column = next(c for c in inspect(connection).get_columns("price_analysis")
                               if c["name"] == "competitor_count")
                 assert column["nullable"] is False
+            connection.rollback()
+    finally:
+        engine.dispose()
+
+
+def test_postgres_canonical_verification_is_read_only():
+    """PostgreSQL enforces read-only mode for all verification statements."""
+    from sqlalchemy import event
+
+    engine = create_engine(TEST_DATABASE_URL)
+    try:
+        with engine.connect() as connection:
+            with connection.begin():
+                connection.exec_driver_sql("SET TRANSACTION READ ONLY")
+                statements = []
+
+                def record_statement(conn, cursor, statement, parameters, context, executemany):
+                    statements.append(statement)
+
+                event.listen(connection, "before_cursor_execute", record_statement)
+                try:
+                    result = verify_canonical_database(connection)
+                finally:
+                    event.remove(connection, "before_cursor_execute", record_statement)
+
+                assert result["safe_to_verify"] is True
+                assert statements
+                assert all(
+                    not statement.lstrip().upper().startswith(
+                        ("UPDATE", "ALTER", "CREATE", "INSERT", "DELETE", "DROP")
+                    )
+                    for statement in statements
+                )
             connection.rollback()
     finally:
         engine.dispose()

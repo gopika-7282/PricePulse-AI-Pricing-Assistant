@@ -54,9 +54,9 @@ jobs:
         run: >-
           python -c "from sqlalchemy import create_engine, inspect; from app.config import DATABASE_URL; i=inspect(create_engine(DATABASE_URL)); assert 'users' in i.get_table_names(); assert next(c for c in i.get_columns('price_analysis') if c['name']=='competitor_count')['nullable'] is False; assert 'ix_users_reset_token' in {x['name'] for x in i.get_indexes('users')}"
       - name: Compare full schema with the independent contract
-        run: python scripts/db_preflight.py preflight
+        run: python scripts/db_preflight.py verify-canonical
       - name: Exercise read-only preflight guard tests
-        run: pytest -q tests/test_canonical_contract.py tests/test_db_preflight.py tests/test_postgres_canonical_migration.py
+        run: python -m pytest -q tests/test_canonical_contract.py tests/test_db_preflight.py tests/test_postgres_canonical_migration.py
 
   backend-tests:
     name: Backend tests (pytest)
@@ -103,17 +103,17 @@ jobs:
       - name: Prepare test result directory
         run: mkdir -p ../test-results
       - name: Run backend tests
-        run: pytest -ra --junitxml=../test-results/backend.xml
+        run: python -m pytest -ra --junitxml=../test-results/backend.xml
       - name: Scraping parser and diagnostics tests
         run: >-
-          pytest -ra tests/test_scraper_diagnostics.py
+          python -m pytest -ra tests/test_scraper_diagnostics.py
           tests/test_multi_platform_scraping.py
           tests/test_amazon_multi_candidate_pipeline.py
           tests/test_product_details_parsing.py
           tests/test_scraping_quantity_reconciliation.py
       - name: Agent orchestration and mocked LLM tests
         run: >-
-          pytest -ra tests/test_llm_reliability.py
+          python -m pytest -ra tests/test_llm_reliability.py
           tests/test_pricing_workflow.py
           tests/test_evidence_workflow.py
           tests/test_strategist_prompt_context.py
